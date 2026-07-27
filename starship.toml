@@ -1,0 +1,212 @@
+add_newline = true
+command_timeout = 500
+palette = "catppuccin_mocha"
+
+# Powerline "capsule" bar.
+# Separators live in the root format (not inside modules) so the rainbow
+# chain stays continuous even when a band is empty.
+format = """
+[](red)\
+$os\
+$username\
+[](fg:red bg:peach)\
+$directory\
+[](fg:peach bg:green)\
+$git_branch\
+$git_status\
+[](fg:green bg:sky)\
+$package\
+$nodejs\
+$python\
+$rust\
+$golang\
+$java\
+$dotnet\
+$docker_context\
+$kubernetes\
+$terraform\
+$aws\
+$gcloud\
+$azure\
+[](fg:sky bg:lavender)\
+$status\
+$jobs\
+$cmd_duration\
+$time\
+[](lavender)\
+$line_break\
+$character\
+"""
+
+[os]
+disabled = false
+style = "bg:red fg:crust"
+format = "[ $symbol]($style)"
+
+[os.symbols]
+Arch = "󰣇"
+Ubuntu = "󰕈"
+Debian = "󰣚"
+Fedora = "󰣛"
+Macos = ""
+Windows = "󰍲"
+
+[username]
+show_always = true
+style_user = "bg:red fg:crust bold"
+style_root = "bg:red fg:crust bold underline"
+format = "[ $user ]($style)"
+
+[hostname]
+disabled = true
+
+[directory]
+style = "bg:peach fg:crust bold"
+format = "[ $path ]($style)"
+truncation_length = 3
+truncation_symbol = "…/"
+read_only = " 󰌾"
+read_only_style = "bg:peach fg:red"
+
+[directory.substitutions]
+"Documents" = "󰈙"
+"Downloads" = ""
+"Music" = "󰝚"
+"Pictures" = ""
+"Work" = "󰃖"
+
+[git_branch]
+symbol = ""
+style = "bg:green fg:crust bold"
+format = "[ $symbol $branch ]($style)"
+
+[git_status]
+style = "bg:green fg:crust"
+format = "[$all_status$ahead_behind ]($style)"
+
+[package]
+style = "bg:sky fg:crust"
+format = "[ $symbol$version ]($style)"
+
+[nodejs]
+symbol = ""
+style = "bg:sky fg:crust"
+format = "[ $symbol $version ]($style)"
+
+[python]
+symbol = ""
+style = "bg:sky fg:crust"
+format = "[ $symbol $version ]($style)"
+
+[rust]
+symbol = ""
+style = "bg:sky fg:crust"
+format = "[ $symbol $version ]($style)"
+
+[golang]
+symbol = ""
+style = "bg:sky fg:crust"
+format = "[ $symbol $version ]($style)"
+
+[java]
+symbol = ""
+style = "bg:sky fg:crust"
+format = "[ $symbol $version ]($style)"
+
+[dotnet]
+symbol = "󰪮"
+style = "bg:sky fg:crust"
+format = "[ $symbol $version ]($style)"
+
+[docker_context]
+symbol = ""
+style = "bg:sky fg:crust"
+format = "[ $symbol $context ]($style)"
+
+[kubernetes]
+disabled = false
+symbol = "☸"
+style = "bg:sky fg:crust"
+format = "[ $symbol $context ]($style)"
+# Only in dirs that actually contain k8s manifests, otherwise it shows everywhere
+detect_files = ["k8s.yaml", "kubeconfig", "skaffold.yaml"]
+detect_folders = ["k8s", "kubernetes", "helm"]
+detect_extensions = []
+
+[terraform]
+symbol = "󱁢"
+style = "bg:sky fg:crust"
+format = "[ $symbol $workspace ]($style)"
+
+[aws]
+# Was showing an empty band everywhere because ~/.aws/config exists.
+# Flip to false if you want the profile in the bar.
+disabled = true
+symbol = "󰸏"
+style = "bg:sky fg:crust"
+format = "[ $symbol $profile ]($style)"
+
+[gcloud]
+symbol = "󰊭"
+style = "bg:sky fg:crust"
+format = "[ $symbol $account ]($style)"
+
+[azure]
+symbol = "󰠅"
+style = "bg:sky fg:crust"
+format = "[ $symbol $subscription ]($style)"
+
+[status]
+disabled = false
+symbol = ""
+style = "bg:lavender fg:red bold"
+format = "[ $symbol$status ]($style)"
+
+[jobs]
+symbol = "󰜎"
+style = "bg:lavender fg:crust"
+format = "[ $symbol$number ]($style)"
+
+[cmd_duration]
+min_time = 2000
+style = "bg:lavender fg:crust"
+format = "[ 󱎫 $duration ]($style)"
+
+[time]
+disabled = false
+time_format = "%H:%M"
+style = "bg:lavender fg:crust bold"
+format = "[ 󰅐 $time ]($style)"
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"
+vimcmd_symbol = "[❮](bold yellow)"
+
+[palettes.catppuccin_mocha]
+rosewater = "#f5e0dc"
+flamingo = "#f2cdcd"
+pink = "#f5c2e7"
+mauve = "#cba6f7"
+red = "#f38ba8"
+maroon = "#eba0ac"
+peach = "#fab387"
+yellow = "#f9e2af"
+green = "#a6e3a1"
+teal = "#94e2d5"
+sky = "#89dceb"
+sapphire = "#74c7ec"
+blue = "#89b4fa"
+lavender = "#b4befe"
+text = "#cdd6f4"
+subtext1 = "#bac2de"
+subtext0 = "#a6adc8"
+overlay2 = "#9399b2"
+overlay1 = "#7f849c"
+overlay0 = "#6c7086"
+surface2 = "#585b70"
+surface1 = "#45475a"
+surface0 = "#313244"
+base = "#1e1e2e"
+mantle = "#181825"
+crust = "#11111b"
