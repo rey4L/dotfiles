@@ -24,3 +24,19 @@ link() {
 
 link starship.toml   .config/starship.toml
 link ghostty/config  .config/ghostty/config
+link tmux/tmux.conf  .config/tmux/tmux.conf
+
+catppuccin_tmux="$HOME/.config/tmux/plugins/catppuccin/tmux"
+if [[ -f "$catppuccin_tmux/catppuccin.tmux" ]]; then
+  echo "ok      Catppuccin tmux plugin"
+elif [[ -e "$catppuccin_tmux" ]]; then
+  echo "error   $catppuccin_tmux exists but is not a valid plugin checkout" >&2
+  exit 1
+else
+  command -v git >/dev/null || {
+    echo "error   git is required to install the Catppuccin tmux plugin" >&2
+    exit 1
+  }
+  git clone --depth 1 https://github.com/catppuccin/tmux.git "$catppuccin_tmux"
+  echo "install Catppuccin tmux plugin"
+fi
