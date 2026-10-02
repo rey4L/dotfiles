@@ -1,0 +1,3 @@
+# Default terminal/editor for uwsm sessions
+export TERMINAL=ghostty
+export EDITOR=nvim

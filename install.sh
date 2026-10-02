@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Symlink every tracked dotfile into $HOME, preserving directory structure.
+# Non-Nix fallback: symlink configs + helper scripts into $HOME.
+# On NixOS, Home Manager (home/home.nix) does the same thing — don't run this there.
 # Existing regular files are moved aside to <file>.backup before linking.
 set -euo pipefail
 
@@ -22,9 +23,23 @@ link() {
   echo "link    $2"
 }
 
-link starship.toml   .config/starship.toml
-link ghostty/config  .config/ghostty/config
-link tmux/tmux.conf  .config/tmux/tmux.conf
+for d in hypr waybar mako walker swayosd ghostty nvim btop fastfetch lazygit imv fontconfig uwsm; do
+  link "config/$d" ".config/$d"
+done
+for f in starship.toml mimeapps.list xdg-terminals.list chromium-flags.conf brave-flags.conf; do
+  link "config/$f" ".config/$f"
+done
+link config/tmux/tmux.conf .config/tmux/tmux.conf
+link config/bash/inputrc   .inputrc
+
+for s in "$repo"/bin/*; do
+  link "bin/$(basename "$s")" ".local/bin/$(basename "$s")"
+done
+
+mkdir -p "$HOME/.local/share/fonts"
+for f in SUSE SUSE-Mono; do
+  link "fonts/$f" ".local/share/fonts/$f"
+done
 
 catppuccin_tmux="$HOME/.config/tmux/plugins/catppuccin/tmux"
 if [[ -f "$catppuccin_tmux/catppuccin.tmux" ]]; then
