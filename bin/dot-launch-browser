@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Launch the default browser. `--private` becomes the right private-window flag.
+default_browser=$(xdg-settings get default-web-browser)
+browser_exec=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' {~/.local,~/.nix-profile,/run/current-system/sw,/etc/profiles/per-user/$USER}/share/applications/$default_browser 2>/dev/null | head -1)
+browser_exec=${browser_exec:-chromium}
+
+if "$browser_exec" --help 2>&1 | grep -q MOZ_LOG; then
+  private_flag="--private-window"
+elif [[ $browser_exec =~ edge ]]; then
+  private_flag="--inprivate"
+else
+  private_flag="--incognito"
+fi
+
+exec setsid uwsm app -- "$browser_exec" "${@/--private/$private_flag}"

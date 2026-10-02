@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Region screenshot -> file + clipboard, click notification to annotate with satty.
+[[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+out="${XDG_PICTURES_DIR:-$HOME/Pictures}"
+mkdir -p "$out"
+pkill slurp && exit 0
+
+hyprpicker -r -z >/dev/null 2>&1 &
+pid=$!
+trap 'kill $pid 2>/dev/null' EXIT
+sleep .1
+
+# Selectable rectangles: windows on the active workspace + monitors
+ws=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .activeWorkspace.id')
+rects=$(
+  hyprctl monitors -j | jq -r --argjson ws "$ws" '.[] | select(.activeWorkspace.id == $ws) | "\(.x),\(.y) \(.width / .scale | floor)x\(.height / .scale | floor)"'
+  hyprctl clients -j | jq -r --argjson ws "$ws" '.[] | select(.workspace.id == $ws) | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"'
+)
+sel=$(echo "$rects" | slurp 2>/dev/null)
+[[ -z $sel ]] && exit 0
+
+# Tiny drag = click: pick the rectangle under the click
+if [[ $sel =~ ^([0-9]+),([0-9]+)[[:space:]]([0-9]+)x([0-9]+)$ ]] && ((BASH_REMATCH[3] * BASH_REMATCH[4] < 20)); then
+  cx=${BASH_REMATCH[1]} cy=${BASH_REMATCH[2]}
+  while read -r r; do
+    [[ $r =~ ^([0-9]+),([0-9]+)[[:space:]]([0-9]+)x([0-9]+) ]] || continue
+    ((cx >= BASH_REMATCH[1] && cx < BASH_REMATCH[1] + BASH_REMATCH[3] && cy >= BASH_REMATCH[2] && cy < BASH_REMATCH[2] + BASH_REMATCH[4])) && { sel="${BASH_REMATCH[1]},${BASH_REMATCH[2]} ${BASH_REMATCH[3]}x${BASH_REMATCH[4]}"; break; }
+  done <<<"$rects"
+fi
+
+file="$out/screenshot-$(date +'%Y-%m-%d_%H-%M-%S').png"
+grim -g "$sel" "$file" || exit 1
+wl-copy <"$file"
+
+(
+  action=$(notify-send "Screenshot saved to clipboard and file" "Click to annotate" -t 10000 -i "$file" -A "default=edit")
+  [[ $action == default ]] && satty --filename "$file" --output-filename "$file" --actions-on-enter save-to-clipboard --save-after-copy --copy-command wl-copy
+) >/dev/null 2>&1 &

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Usage: dot-monitor-internal on|off|toggle  (eDP-1)
+mon=eDP-1
+case "${1:-toggle}" in
+on) hyprctl keyword monitor "$mon,preferred,auto,2" ;;
+off) hyprctl keyword monitor "$mon,disable" ;;
+toggle) hyprctl monitors -j | jq -e --arg m "$mon" '.[]|select(.name==$m)' >/dev/null && "$0" off || "$0" on ;;
+esac

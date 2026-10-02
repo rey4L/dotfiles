@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Exit 0 if any non-eDP monitor is connected.
+hyprctl monitors -j | jq -e '[.[]|select(.name|startswith("eDP")|not)]|length>0' >/dev/null

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Usage: dot-launch-or-focus <window-pattern> [launch-command]
+(($# == 0)) && { echo "Usage: dot-launch-or-focus <window-pattern> [launch-command]"; exit 1; }
+
+pattern="$1"
+launch="${2:-"uwsm app -- $pattern"}"
+addr=$(hyprctl clients -j | jq -r --arg p "$pattern" '.[]|select((.class|test("\\b" + $p + "\\b";"i")) or (.title|test("\\b" + $p + "\\b";"i")))|.address' | head -n1)
+
+if [[ -n $addr ]]; then
+  hyprctl dispatch focuswindow "address:$addr"
+else
+  eval exec setsid $launch
+fi

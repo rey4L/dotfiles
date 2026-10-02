@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Usage: dot-launch-tui <command> [args...] — run TUI in ghostty with matching app-id.
+exec setsid uwsm app -- ghostty --class="org.local.$(basename "$1")" -e "$@"

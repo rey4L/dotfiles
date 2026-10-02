@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Cycle default PipeWire sink.
+mapfile -t sinks < <(wpctl status | sed -n '/Sinks:/,/Sources:/p' | grep -oE '[0-9]+\.' | tr -d .)
+((${#sinks[@]} < 2)) && exit 0
+cur=$(wpctl status | sed -n '/Sinks:/,/Sources:/p' | grep '\*' | grep -oE '[0-9]+\.' | head -1 | tr -d .)
+for i in "${!sinks[@]}"; do
+  [[ ${sinks[$i]} == "$cur" ]] && next=${sinks[$(((i + 1) % ${#sinks[@]}))]}
+done
+wpctl set-default "${next:-${sinks[0]}}"
