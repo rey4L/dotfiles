@@ -7,11 +7,8 @@
     ghostty
     waybar
     mako
-    walker
-    elephant
     swaybg
     swayosd
-    hypridle
     hyprlock
     hyprsunset
     hyprpicker
@@ -21,39 +18,33 @@
     slurp
     satty
     wl-clipboard
-    gpu-screen-recorder
-    brightnessctl
+    cliphist
+    fuzzel
+    rofi # clipboard picker with image thumbnails (dot-clipboard)
     pamixer
     playerctl
     wiremix
-    impala
     bluetui
     libnotify
-    qalculate-gtk
-    libqalculate
     wev
     evtest
     kdePackages.qtstyleplugin-kvantum
     libsForQt5.qtstyleplugin-kvantum
     gnome-themes-extra
-    yaru-theme
     adwaita-icon-theme
 
     # --- Files / media
     nautilus
-    sushi
     gvfs
     gnome-calculator
     gnome-disk-utility
     evince
     imv
-    mpv
+    mpv-unwrapped
     ffmpeg
     ffmpegthumbnailer
     imagemagick
-    tesseract
     yazi
-    localsend
 
     # --- CLI
     neovim
@@ -68,9 +59,9 @@
     jq
     dust
     gum
-    btop
+    btop-cuda # btop with NVIDIA GPU support (NVML)
+    heroic
     fastfetch
-    lazygit
     lazydocker
     mise
     git
@@ -84,54 +75,33 @@
     inetutils
     whois
     inxi
-    powertop
     xmlstarlet
     tree-sitter
     luarocks
     dosfstools
     exfatprogs
     btrfs-progs
+    tailscale
 
     # --- Languages / toolchains (mise handles per-project versions)
+    # Global defaults so LazyVim works: treesitter compiles parsers with gcc,
+    # Mason installs LSPs/formatters with go (gopls…), npm (jsonls, dockerls, sqlls…) and pip (sqlfluff).
     gcc
-    clang
-    llvm
-    rustc
-    cargo
-    ruby
+    gnumake
+    go
+    nodejs
     python3
-    dotnet-runtime_9
-    postgresql
-    mariadb-connector-c
 
     # --- Cloud / dev tools
-    awscli2
-    google-cloud-sdk
     docker-compose
     docker-buildx
-    bruno
-    dbeaver-bin
-    quickemu
-    qemu
-    rustdesk
     claude-code
 
     # --- Apps
     chromium
-    brave
-    vscode
-    obsidian
-    typora
-    spotify
-    signal-desktop
-    teams-for-linux
     keepassxc
-    xournalpp
-    pinta
-    gimp
-    kdePackages.kdenlive
-    obs-studio
-    libreoffice-fresh
-    openrgb
+    discord
+    hubstaff
+    qbittorrent
   ];
 }

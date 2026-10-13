@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pick a tmux session (or start a new one) from fuzzel and open it in ghostty.
+# Starting the tmux server triggers tmux-continuum's restore, so after a reboot
+# the saved sessions show up here once the server is up.
+set -u
+
+# Make sure a server exists so continuum can restore the last save.
+if ! tmux has-session 2>/dev/null; then
+  tmux start-server \; run-shell ~/.config/tmux/plugins/tmux-continuum/scripts/continuum_restore.sh 2>/dev/null
+  sleep 1
+fi
+
+choice=$(
+  {
+    tmux list-sessions -F '#{session_name}: #{session_windows} windows#{?session_attached, (attached),}' 2>/dev/null
+    echo "+ new session"
+  } | fuzzel --dmenu --prompt='tmux ' --width=50
+) || exit 0
+[[ -z $choice ]] && exit 0
+
+if [[ $choice == "+ new session" ]]; then
+  name=$(fuzzel --dmenu --prompt='name ' --lines=0 </dev/null) || exit 0
+  [[ -z $name ]] && name=Work
+  exec setsid ghostty -e tmux new-session -A -s "$name"
+fi
+
+exec setsid ghostty -e tmux attach -t "${choice%%:*}"

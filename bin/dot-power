@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Power menu (SUPER+O), or an action from a launcher entry.
+# Asks for confirmation, and saves tmux sessions first so tmux-continuum restores
+# an up-to-date layout after the reboot instead of the last 15-minute autosave.
+set -u
+
+action=${1:-}
+if [[ -z $action ]]; then
+  choice=$(printf 'Lock\nSuspend\nLog out\nRestart\nShut down\n' | fuzzel --dmenu --prompt='Power ' --lines=5 --width=30) || exit 0
+  case $choice in
+    Lock) exec dot-lock ;;
+    Suspend) action=suspend ;;
+    'Log out') action=logout ;;
+    Restart) action=reboot ;;
+    'Shut down') action=poweroff ;;
+    *) exit 0 ;;
+  esac
+fi
+case $action in
+  poweroff) label="Shut down" ;;
+  reboot) label="Restart" ;;
+  logout) label="Log out" ;;
+  suspend) label="Suspend" ;;
+  *) echo "Usage: dot-power [poweroff|reboot|logout|suspend]" >&2; exit 1 ;;
+esac
+
+choice=$(printf 'No\nYes, %s\n' "${label,}" | fuzzel --dmenu --prompt="$label? " --lines=2 --width=30) || exit 0
+[[ $choice == Yes* ]] || exit 0
+
+if [[ $action != suspend ]] && tmux has-session 2>/dev/null; then
+  tmux run-shell ~/.config/tmux/plugins/tmux-resurrect/scripts/save.sh
+fi
+
+case $action in
+  poweroff) systemctl poweroff ;;
+  reboot) systemctl reboot ;;
+  logout) hyprctl dispatch 'hl.dsp.exit()' ;;
+  suspend) dot-lock; sleep 1; systemctl suspend ;; # give hyprlock time to grab the screen
+esac

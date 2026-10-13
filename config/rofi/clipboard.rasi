@@ -1,0 +1,47 @@
+/* Clipboard history picker (dot-clipboard). Catppuccin Mocha, matches fuzzel.ini.
+   Search box and selection styling inspired by 43PR/dotfiles.
+   Rofi instead of fuzzel only because fuzzel can't draw icons bigger than a text line. */
+configuration {
+  show-icons: true;
+  font: "SUSE Mono 12";
+}
+
+* {
+  bg: #1e1e2e;
+  surface: #181825;
+  fg: #cdd6f4;
+  sel: #313244;
+  accent: #89b4fa;
+  background-color: transparent;
+  text-color: @fg;
+}
+
+window {
+  location: center;
+  anchor: center;
+  width: 40%;
+  background-color: @bg;
+  border: 1px;
+  border-color: @accent;
+  border-radius: 10px;
+  padding: 12px 16px;
+}
+
+mainbox { children: [ inputbar, listview ]; spacing: 12px; }
+
+inputbar {
+  children: [ prompt, entry ];
+  spacing: 8px;
+  background-color: @surface;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+prompt { text-color: @accent; }
+entry { placeholder: "Search…"; placeholder-color: #7f849c; }
+
+listview { lines: 7; scrollbar: false; spacing: 4px; fixed-height: true; }
+
+element { padding: 6px 10px; spacing: 12px; border-radius: 8px; border: 1px; border-color: transparent; }
+element selected { background-color: @sel; border-color: @accent; text-color: @accent; }
+element-icon { size: 3em; }
+element-text { vertical-align: 0.5; text-color: inherit; highlight: bold #cba6f7; }

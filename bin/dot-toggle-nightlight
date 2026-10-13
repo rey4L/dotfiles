@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ON_TEMP=4000 OFF_TEMP=6000
 if ! pgrep -x hyprsunset >/dev/null; then
-  setsid uwsm app -- hyprsunset &
+  setsid hyprsunset &
   sleep 1
 fi
 current=$(hyprctl hyprsunset temperature 2>/dev/null | grep -oE '[0-9]+')

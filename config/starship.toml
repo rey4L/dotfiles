@@ -9,6 +9,7 @@ format = """
 [](red)\
 $os\
 $username\
+$hostname\
 [](fg:red bg:peach)\
 $directory\
 [](fg:peach bg:green)\
@@ -55,10 +56,13 @@ Windows = "󰍲"
 show_always = true
 style_user = "bg:red fg:crust bold"
 style_root = "bg:red fg:crust bold underline"
-format = "[ $user ]($style)"
+format = "[ $user]($style)"
 
 [hostname]
-disabled = true
+disabled = false
+ssh_only = false
+style = "bg:red fg:crust bold"
+format = "[@$hostname ]($style)"
 
 [directory]
 style = "bg:peach fg:crust bold"

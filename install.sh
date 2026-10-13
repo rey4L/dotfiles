@@ -23,7 +23,7 @@ link() {
   echo "link    $2"
 }
 
-for d in hypr waybar mako walker swayosd ghostty nvim btop fastfetch lazygit imv fontconfig uwsm; do
+for d in hypr waybar mako fuzzel swayosd ghostty nvim btop fastfetch imv fontconfig; do
   link "config/$d" ".config/$d"
 done
 for f in starship.toml mimeapps.list xdg-terminals.list chromium-flags.conf brave-flags.conf; do

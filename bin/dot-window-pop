@@ -1,15 +1,35 @@
 #!/usr/bin/env bash
-# Toggle: float + pin a tile at a fixed size, or put it back.
-width=${1:-1300} height=${2:-900}
+# Toggle: float + pin at 70% of the window's monitor, or put it back.
+# Optional width/height arguments are logical pixels, as before.
+set -euo pipefail
+if (( $# > 2 )) || { (( $# > 0 )) && [[ ! $1 =~ ^[1-9][0-9]*$ ]]; } || { (( $# > 1 )) && [[ ! $2 =~ ^[1-9][0-9]*$ ]]; }; then
+  echo "Usage: dot-window-pop [width [height]]" >&2
+  exit 1
+fi
 active=$(hyprctl activewindow -j)
-pinned=$(jq -r .pinned <<<"$active")
-addr=$(jq -r .address <<<"$active")
+read -r addr pinned monitor < <(jq -r '[.address // "none", .pinned // false, .monitor // -1] | @tsv' <<<"$active")
+[[ $addr =~ ^0x[[:xdigit:]]+$ ]] || exit 0
+w="window = \"address:$addr\""
 
 if [[ $pinned == true ]]; then
-  hyprctl -q --batch "dispatch pin address:$addr;" "dispatch togglefloating address:$addr;" "dispatch tagwindow -pop address:$addr;"
-elif [[ -n $addr ]]; then
-  hyprctl dispatch togglefloating address:$addr
-  hyprctl dispatch resizeactive exact $width $height address:$addr
-  hyprctl dispatch centerwindow address:$addr
-  hyprctl -q --batch "dispatch pin address:$addr;" "dispatch alterzorder top address:$addr;" "dispatch tagwindow +pop address:$addr;"
+  hyprctl -q eval "
+    hl.dispatch(hl.dsp.window.pin({ $w, action = \"disable\" }))
+    hl.dispatch(hl.dsp.window.float({ $w, action = \"disable\" }))
+    hl.dispatch(hl.dsp.window.tag({ $w, tag = \"-pop\" }))"
+else
+  # Monitor sizes are physical pixels; account for rotation and fractional scale.
+  dimensions=$(hyprctl monitors -j | jq -er --argjson id "$monitor" '
+    .[] | select(.id == $id)
+    | (if ((.transform // 0) % 2) == 1 then [.height, .width] else [.width, .height] end) as $size
+    | [($size[0] / .scale * 7 / 10 | floor), ($size[1] / .scale * 7 / 10 | floor)]
+    | @tsv')
+  read -r width height <<<"$dimensions"
+  width=${1:-$width} height=${2:-$height}
+  hyprctl -q eval "
+    hl.dispatch(hl.dsp.window.float({ $w, action = \"enable\" }))
+    hl.dispatch(hl.dsp.window.resize({ $w, x = $width, y = $height, relative = false }))
+    hl.dispatch(hl.dsp.window.center({ $w }))
+    hl.dispatch(hl.dsp.window.pin({ $w, action = \"enable\" }))
+    hl.dispatch(hl.dsp.window.alter_zorder({ $w, mode = \"top\" }))
+    hl.dispatch(hl.dsp.window.tag({ $w, tag = \"+pop\" }))"
 fi

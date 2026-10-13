@@ -10,17 +10,21 @@
   };
 
   outputs = { nixpkgs, home-manager, ... }: {
-    nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
+    nixosConfigurations.jojen = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        ./hosts/nixos/configuration.nix
+        ./hosts/jojen/configuration.nix
         home-manager.nixosModules.home-manager
-        {
+        ({ pkgs, ... }: {
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
-          home-manager.backupFileExtension = "backup";
+          # Timestamped backups never collide, so a file in the way of a link
+          # can't abort activation (a fixed ".backup" name did on 2026-10-12).
+          home-manager.backupCommand = pkgs.writeShellScript "hm-backup" ''
+            mv -- "$1" "$1.hm-backup-$(date +%Y%m%d-%H%M%S)"
+          '';
           home-manager.users.rey = import ./home/home.nix;
-        }
+        })
       ];
     };
   };

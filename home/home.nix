@@ -5,19 +5,21 @@ let
   link = path: config.lib.file.mkOutOfStoreSymlink "${repo}/${path}";
 
   configDirs = [
-    "hypr" "waybar" "mako" "walker" "swayosd" "ghostty" "nvim" "btop"
-    "fastfetch" "lazygit" "imv" "fontconfig" "uwsm"
+    "hypr" "waybar" "mako" "swayosd" "ghostty" "nvim" "btop"
+    "fastfetch" "imv" "fuzzel" "Kvantum" "rofi" "nix-spin" "MangoHud"
   ];
   configFiles = [
     "starship.toml" "mimeapps.list" "xdg-terminals.list"
-    "chromium-flags.conf" "brave-flags.conf"
+    "chromium-flags.conf" "brave-flags.conf" "fontconfig/fonts.conf"
   ];
   binScripts = builtins.attrNames (builtins.readDir ../bin);
 in
 {
+  imports = [ ./nix-spin.nix ];
+
   home.username = "rey";
   home.homeDirectory = "/home/rey";
-  home.stateVersion = "25.11";
+  home.stateVersion = "25.05";
   programs.home-manager.enable = true;
 
   xdg.configFile =
@@ -25,13 +27,22 @@ in
     // lib.genAttrs configFiles (f: { source = link "config/${f}"; })
     // {
       "tmux/tmux.conf".source = link "config/tmux/tmux.conf";
+      "readline/inputrc".source = link "config/bash/inputrc"; # INPUTRC is set in modules/base.nix
     };
 
   home.file =
-    lib.listToAttrs (map (n: lib.nameValuePair ".local/bin/${n}" { source = link "bin/${n}"; }) binScripts)
-    // {
-      ".inputrc".source = link "config/bash/inputrc";
-    };
+    lib.listToAttrs (map (n: lib.nameValuePair ".local/bin/${n}" { source = link "bin/${n}"; }) binScripts);
+
+  # Prefer ~/.config etc. over dotfiles in $HOME where Home Manager supports it (e.g. gtkrc-2.0)
+  home.preferXdgDirectories = true;
+
+  # Bash history lives in ~/.local/state; carry over the old ~/.bash_history once
+  home.activation.bashHistory = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    run mkdir -p "${config.xdg.stateHome}/bash"
+    if [ -f "$HOME/.bash_history" ] && [ ! -e "${config.xdg.stateHome}/bash/history" ]; then
+      run mv "$HOME/.bash_history" "${config.xdg.stateHome}/bash/history"
+    fi
+  '';
 
   # tmux theme plugin (tmux.conf sources it from ~/.config/tmux/plugins)
   home.activation.catppuccinTmux = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
@@ -39,6 +50,16 @@ in
     if [ ! -f "$dir/catppuccin.tmux" ]; then
       run ${pkgs.git}/bin/git clone --depth 1 https://github.com/catppuccin/tmux.git "$dir"
     fi
+  '';
+
+  # tmux persistence plugins (tmux.conf runs them from ~/.config/tmux/plugins)
+  home.activation.tmuxPersistence = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    for p in tmux-resurrect tmux-continuum; do
+      dir="$HOME/.config/tmux/plugins/$p"
+      if [ ! -d "$dir" ]; then
+        run ${pkgs.git}/bin/git clone --depth 1 https://github.com/tmux-plugins/$p.git "$dir"
+      fi
+    done
   '';
 
   home.sessionVariables = {
@@ -57,6 +78,7 @@ in
     historyControl = [ "ignoreboth" ];
     historySize = 32768;
     historyFileSize = 32768;
+    historyFile = "${config.xdg.stateHome}/bash/history";
     shellAliases = {
       ls = "eza -lh --group-directories-first --icons=auto";
       lsa = "ls -a";
@@ -93,13 +115,13 @@ in
       }
       alias cd=zd
 
-      for f in ~/dotfiles/config/bash/fns/*; do source "$f"; done
+      for f in ~/dotfiles/config/bash/fns/*; do [ -f "$f" ] && source "$f"; done
 
       # Machine-local extras (not tracked): put secrets/paths in ~/.bashrc.local
       [ -f ~/.bashrc.local ] && source ~/.bashrc.local
     '';
   };
-  programs.starship.enable = true; # config comes from config/starship.toml
+  programs.starship.enable = true;
   programs.zoxide.enable = true;
   programs.fzf.enable = true;
   programs.mise = {
@@ -145,10 +167,20 @@ in
   # --- Theme
   gtk = {
     enable = true;
-    font = { name = "SUSE"; size = 11; };
+    font = { name = "Vegur"; size = 11; };
     theme = { name = "Adwaita-dark"; package = pkgs.gnome-themes-extra; };
+    gtk4.theme = config.gtk.theme;
     gtk3.extraConfig.gtk-application-prefer-dark-theme = true;
     gtk4.extraConfig.gtk-application-prefer-dark-theme = true;
   };
   dconf.settings."org/gnome/desktop/interface".color-scheme = "prefer-dark";
+
+  # One cursor theme for Hyprland, GTK and XWayland (default theme in ~/.local/share/icons)
+  home.pointerCursor = {
+    name = "Adwaita";
+    package = pkgs.adwaita-icon-theme;
+    size = 20;
+    enable = true;
+    dotIcons.enable = false;
+  };
 }

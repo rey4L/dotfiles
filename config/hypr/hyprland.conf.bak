@@ -4,7 +4,7 @@
 ################ ENV ################
 env = XCURSOR_SIZE,24
 env = HYPRCURSOR_SIZE,24
-env = GDK_SCALE,2
+env = GDK_SCALE,1
 env = GDK_BACKEND,wayland,x11,*
 env = QT_QPA_PLATFORM,wayland;xcb
 env = QT_STYLE_OVERRIDE,kvantum
@@ -24,8 +24,8 @@ ecosystem {
 }
 
 ################ MONITORS ################
-# hyprctl monitors  -> list outputs. Retina-class 2x display.
-monitor = , preferred, auto, 2
+# hyprctl monitors  -> list outputs. 1440p desktop display (scale 1).
+monitor = , highrr, auto, 1
 # External 1440p example (see scripts/toggle-monitors.sh):
 # monitor = HDMI-A-1, 2560x1440@60, auto, 1
 
@@ -227,7 +227,7 @@ windowrule = opacity 1 1, match:class qemu
 windowrule = rounding 8, match:tag pop
 windowrule = idle_inhibit always, match:tag noidle
 
-layerrule = no_anim on, match:namespace walker
+layerrule = no_anim on, match:namespace launcher
 
 # LocalSend, 1Password, Typora, Telegram
 windowrule = float on, match:class (Share|localsend)
@@ -242,12 +242,14 @@ windowrule = focus_on_activate off, match:class org.telegram.desktop
 windowrule = opacity 0.985 0.96, match:tag default-opacity
 
 ################ AUTOSTART ################
-exec-once = uwsm app -- hypridle
-exec-once = uwsm app -- mako
-exec-once = uwsm app -- waybar
-exec-once = uwsm app -- fcitx5 --disable notificationitem
-exec-once = uwsm app -- swaybg -i ~/.config/hypr/wallpaper.png -m fill
-exec-once = uwsm app -- swayosd-server
+exec-once = hypridle
+exec-once = mako
+exec-once = waybar
+exec-once = fcitx5 --disable notificationitem
+exec-once = swaybg -i ~/.config/hypr/wallpaper.png -m fill
+exec-once = swayosd-server
+exec-once = wl-paste --type text --watch cliphist store
+exec-once = wl-paste --type image --watch cliphist store
 exec-once = systemctl --user start hyprpolkitagent
 exec-once = systemctl --user import-environment $(env | cut -d'=' -f 1)
 exec-once = dbus-update-activation-environment --systemd --all
@@ -257,7 +259,7 @@ exec-once = dbus-update-activation-environment --systemd --all
 bindd = SUPER, C, Universal copy, sendshortcut, CTRL, Insert, activewindow
 bindd = SUPER, V, Universal paste, sendshortcut, SHIFT, Insert, activewindow
 bindd = SUPER, X, Universal cut, sendshortcut, CTRL, X, activewindow
-bindd = SUPER CTRL, V, Clipboard manager, exec, dot-walker -m clipboard
+bindd = SUPER CTRL, V, Clipboard manager, exec, dot-clipboard
 
 # --- Media / brightness (swayosd)
 bindeld = ,XF86AudioRaiseVolume, Volume up, exec, swayosd-client --output-volume raise
@@ -415,8 +417,7 @@ bindd = SUPER ALT, F, Full width, fullscreen, 1
 bindd = SUPER, O, Pop window out (float & pin), exec, dot-window-pop
 
 # --- Launchers / utilities
-bindd = SUPER, SPACE, Launch apps, exec, dot-walker
-bindd = SUPER CTRL, E, Emoji picker, exec, dot-walker -m symbols
+bindd = SUPER, SPACE, Launch apps, exec, fuzzel
 bindd = SUPER, ESCAPE, Lock system, exec, dot-lock
 bindld = , XF86PowerOff, Lock, exec, dot-lock
 bindd = SUPER CTRL, L, Lock system, exec, dot-lock
@@ -451,20 +452,20 @@ bindd = SUPER CTRL, Z, Zoom in, exec, hyprctl keyword cursor:zoom_factor $(hyprc
 bindd = SUPER CTRL ALT, Z, Reset zoom, exec, hyprctl keyword cursor:zoom_factor 1
 
 # --- Applications (personal)
-bindd = SUPER, RETURN, Terminal, exec, uwsm app -- ghostty --working-directory="$(dot-terminal-cwd)"
-bindd = SUPER ALT, RETURN, Tmux, exec, uwsm app -- ghostty --working-directory="$(dot-terminal-cwd)" -e bash -c "tmux attach || tmux new -s Work"
+bindd = SUPER, RETURN, Terminal, exec, ghostty --working-directory="$(dot-terminal-cwd)"
+bindd = SUPER ALT, RETURN, Tmux, exec, ghostty --working-directory="$(dot-terminal-cwd)" -e bash -c "tmux attach || tmux new -s Work"
 bindd = SUPER SHIFT, RETURN, Browser, exec, dot-launch-browser
-bindd = SUPER SHIFT, F, File manager, exec, uwsm app -- nautilus --new-window
-bindd = SUPER ALT SHIFT, F, File manager (cwd), exec, uwsm app -- nautilus --new-window "$(dot-terminal-cwd)"
+bindd = SUPER SHIFT, F, File manager, exec, nautilus --new-window
+bindd = SUPER ALT SHIFT, F, File manager (cwd), exec, nautilus --new-window "$(dot-terminal-cwd)"
 bindd = SUPER SHIFT, B, Browser, exec, dot-launch-browser
 bindd = SUPER SHIFT ALT, B, Browser (private), exec, dot-launch-browser --private
 bindd = SUPER SHIFT, M, Music, exec, dot-launch-or-focus spotify
 bindd = SUPER SHIFT, N, Editor, exec, dot-launch-editor
 bindd = SUPER SHIFT, D, Docker, exec, dot-launch-tui lazydocker
-bindd = SUPER SHIFT, G, Signal, exec, dot-launch-or-focus ^signal$ "uwsm app -- signal-desktop"
-bindd = SUPER SHIFT, O, Obsidian, exec, dot-launch-or-focus ^obsidian$ "uwsm app -- obsidian"
-bindd = SUPER SHIFT, W, Typora, exec, uwsm app -- typora --enable-wayland-ime
-bindd = SUPER SHIFT, SLASH, Passwords, exec, uwsm app -- keepassxc
+bindd = SUPER SHIFT, G, Signal, exec, dot-launch-or-focus ^signal$ "signal-desktop"
+bindd = SUPER SHIFT, O, Obsidian, exec, dot-launch-or-focus ^obsidian$ "obsidian"
+bindd = SUPER SHIFT, W, Typora, exec, typora --enable-wayland-ime
+bindd = SUPER SHIFT, SLASH, Passwords, exec, keepassxc
 bindd = SUPER SHIFT, A, ChatGPT, exec, dot-launch-webapp "https://chatgpt.com"
 bindd = SUPER SHIFT ALT, A, Grok, exec, dot-launch-webapp "https://grok.com"
 bindd = SUPER SHIFT, C, Calendar, exec, dot-launch-webapp "https://app.hey.com/calendar/weeks/"

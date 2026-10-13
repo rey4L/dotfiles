@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# SUPER+R: toggle focused-monitor recording with system audio, GPU-only, 30 fps.
+# A transient user service owns the process; nothing runs while recording is off.
+set -euo pipefail
+unit=dot-record.service
+notify() { notify-send "$@" || true; }
+refresh() { pkill -RTMIN+11 -x waybar || true; }
+
+case ${1:-toggle} in
+  status)
+    if systemctl --user is-active --quiet "$unit"; then
+      printf '%s\n' '{"text":"● REC","class":"recording","tooltip":"Recording monitor + system audio; Super+R to stop"}'
+    else
+      printf '%s\n' '{"text":"","tooltip":""}'
+    fi
+    exit 0 ;;
+  finished)
+    refresh
+    if [[ ${SERVICE_RESULT:-} == success && -s ${DOT_RECORD_FILE:-} ]]; then
+      notify 'Recording saved' "$DOT_RECORD_FILE"
+    else
+      notify -u critical 'Recording failed' 'See: journalctl --user -u dot-record.service -n 30 --no-pager -l'
+    fi
+    exit 0 ;;
+  toggle) ;;
+  *) echo 'Usage: dot-record [toggle|status]' >&2; exit 1 ;;
+esac
+
+# Ignore overlapping key presses while a start/stop is being processed.
+exec 9>"${XDG_RUNTIME_DIR:?}/dot-record.lock"
+flock -n 9 || exit 0
+if systemctl --user is-active --quiet "$unit"; then
+  systemctl --user stop "$unit" # SIGINT finalizes the video before exiting.
+  refresh
+  exit 0
+fi
+
+# Direct Wayland capture needs the NixOS capability wrapper, not bare pkexec.
+if [[ ! -x /run/wrappers/bin/gsr-kms-server ]]; then
+  notify -u critical 'Recorder setup needs a rebuild' 'Run: sudo nixos-rebuild switch --flake ~/dotfiles#jojen'
+  exit 1
+fi
+
+monitor=$(hyprctl monitors -j | jq -er '.[] | select(.focused) | .name') || {
+  notify -u critical 'Recording failed' 'Could not find the focused monitor.'
+  exit 1
+}
+[[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+out="${XDG_VIDEOS_DIR:-$HOME/Videos}"
+mkdir -p "$out"
+file="$out/recording-$(date +'%Y-%m-%d_%H-%M-%S-%N').mp4"
+recorder=$(command -v gpu-screen-recorder)
+self=$(readlink -f "$0")
+systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+if ! systemd-run --user --quiet --collect --unit="$unit" --service-type=exec \
+  --property=KillSignal=SIGINT --property=SuccessExitStatus=SIGINT \
+  --property=TimeoutStopSec=30 --property="ExecStopPost=$self finished" \
+  --setenv="DOT_RECORD_FILE=$file" \
+  --setenv="WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}" \
+  --setenv="DISPLAY=${DISPLAY:-}" \
+  "$recorder" -w "$monitor" -f 30 -fm vfr -k h264 -ac aac \
+  -a default_output -encoder gpu -fallback-cpu-encoding no -o "$file"; then
+  notify -u critical 'Recording failed' 'Could not start the recorder service.'
+  exit 1
+fi
+refresh
+notify 'Recording started' "$monitor + system audio · Super+R to stop"

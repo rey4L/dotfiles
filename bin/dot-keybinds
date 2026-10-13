@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Searchable list of Hyprland keybindings (descriptions from bind() in hyprland.lua). Bound to SUPER+K.
+pkill -x rofi && exit 0 # pressing SUPER+K again closes it
+
+hyprctl binds -j | jq -r '
+  .[] | select(.has_description and .submap == "")
+  | .description as $desc | .modmask as $mask
+  | ([[64, "SUPER"], [4, "CTRL"], [8, "ALT"], [1, "SHIFT"]]
+     | map(select(($mask / .[0] | floor) % 2 == 1) | .[1])) + [.key]
+  | "\(join(" + "))\t\($desc)"' |
+  awk -F'\t' '{ printf "%-28s %s\n", $1, $2 }' |
+  rofi -dmenu -i -p "" -no-custom -theme ~/.config/rofi/keybinds.rasi >/dev/null

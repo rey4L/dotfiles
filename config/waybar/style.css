@@ -51,7 +51,6 @@ window#waybar {
 }
 
 #cpu,
-#battery,
 #pulseaudio,
 #custom-launcher {
   min-width: 12px;
@@ -75,7 +74,18 @@ window#waybar {
 }
 
 tooltip {
-  padding: 2px;
+  background-color: #1e1e2e;
+  border: 1px solid #89b4fa;
+  border-radius: 8px;
+}
+
+tooltip label {
+  padding: 12px;
+}
+
+#custom-recording.recording {
+  color: #f38ba8;
+  margin-right: 12px;
 }
 
 #clock {
@@ -86,7 +96,6 @@ tooltip {
   opacity: 0;
 }
 
-#custom-idle-indicator,
 #custom-notification-silencing-indicator {
   min-width: 12px;
   margin-left: 5px;
@@ -95,7 +104,6 @@ tooltip {
   padding-bottom: 1px;
 }
 
-#custom-idle-indicator.active,
 #custom-notification-silencing-indicator.active {
   color: #a55555;
 }

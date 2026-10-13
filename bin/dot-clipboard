@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Clipboard history picker: cliphist (store) + rofi, or fuzzel before rofi is installed (menu). Bound to SUPER CTRL+V.
+# Image entries get a cached thumbnail via the rofi/fuzzel "\0icon\x1f<path>" dmenu suffix.
+thumbs="${XDG_CACHE_HOME:-$HOME/.cache}/cliphist-thumbs"
+mkdir -p "$thumbs"
+
+cliphist list | while IFS= read -r line; do
+  if [[ $line == *$'\t[[ binary data '*' '@(png|jpg|jpeg|bmp|webp|gif)' '* ]]; then
+    thumb="$thumbs/${line%%$'\t'*}.png"
+    [[ -s $thumb ]] || cliphist decode <<<"$line" | magick - -thumbnail 512x512 "$thumb" 2>/dev/null
+    printf '%s\0icon\x1f%s\n' "$line" "$thumb"
+  else
+    printf '%s\n' "$line"
+  fi
+done | if command -v rofi >/dev/null; then
+  # rofi draws the thumbnails at a usable size (config/rofi/clipboard.rasi)
+  rofi -dmenu -i -p "" -theme ~/.config/rofi/clipboard.rasi
+else
+  fuzzel --dmenu --width 60 --lines 12 --prompt "  "
+fi >"$thumbs/.selection"
+
+# Esc returns nothing; skip so the current clipboard isn't wiped
+[[ -s $thumbs/.selection ]] && cliphist decode <"$thumbs/.selection" | wl-copy

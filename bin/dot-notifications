@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""On-demand Mako notification center in fzf; no watcher or persistent storage."""
+import html
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+def plain(value):
+    # Notification markup is text, never terminal control sequences or commands.
+    text = html.unescape(re.sub(r"<[^>]*>", "", value or ""))
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
+
+
+def details(item):
+    return "\n\n".join(filter(None, (
+        plain(item.get("app_name")), plain(item.get("summary")),
+        plain(item.get("body")),
+    )))
+
+
+def fetch(command):
+    result = subprocess.run(["makoctl", command, "-j"], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Could not connect to Mako")
+    return json.loads(result.stdout)
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--preview":
+        with open(sys.argv[2]) as stream:
+            items = json.load(stream)
+        item = items.get(sys.argv[3])
+        if item:
+            print(details(item))
+        return
+
+    header = "Enter: copy message | Ctrl-A: actions | Ctrl-D: dismiss | Esc: close"
+    # Private temporary data is removed when the menu closes; Mako owns history.
+    with tempfile.TemporaryDirectory(prefix="dot-notifications-", dir=os.environ.get("XDG_RUNTIME_DIR")) as directory:
+        path = os.path.join(directory, "messages.json")
+        while True:
+            active, history = fetch("list"), fetch("history")
+            items, rows = {}, []
+            for state, notifications in (("Active", active), ("History", history)):
+                for notification in notifications:
+                    key = f"{state}:{int(notification['id'])}"
+                    items[key] = dict(notification, state=state)
+                    app = plain(notification.get("app_name")) or "Notification"
+                    summary = plain(notification.get("summary")) or plain(notification.get("body"))
+                    label = re.sub(r"\s+", " ", f"[{state}] {app} — {summary}")
+                    rows.append(f"{key}\t{label}")
+            with open(path, "w") as stream:
+                json.dump(items, stream)
+            preview = " ".join(map(shlex.quote, (sys.executable, os.path.realpath(__file__), "--preview", path))) + " {1}"
+            result = subprocess.run([
+                "fzf", "--delimiter=\t", "--with-nth=2..", "--layout=reverse",
+                "--border=rounded", "--prompt=Notifications > ", "--header=" + header,
+                "--expect=ctrl-a,ctrl-d", "--preview=" + preview,
+                "--preview-window=right,50%,wrap", "--no-multi",
+                "--color=bg:#1e1e2e,fg:#cdd6f4,bg+:#313244,fg+:#89b4fa,hl:#cba6f7,hl+:#cba6f7,border:#89b4fa,prompt:#89b4fa,header:#a6adc8",
+            ], input="\n".join(rows), capture_output=True, text=True)
+            if result.returncode or not result.stdout.strip():
+                return
+            lines = result.stdout.splitlines()
+            if len(lines) < 2:
+                return
+            action, key = lines[0], lines[1].split("\t", 1)[0]
+            item = items.get(key)
+            if not item:
+                return
+            if action == "":
+                subprocess.run(["wl-copy"], input=details(item), text=True, check=True)
+                return
+            if item["state"] == "History":
+                header = "History actions have expired. Enter: copy message | Esc: close"
+                continue
+            if action == "ctrl-d":
+                subprocess.run(["makoctl", "dismiss", "-n", str(item["id"])], check=True)
+            elif action == "ctrl-a":
+                if not item.get("actions"):
+                    header = "This notification has no actions. Enter: copy | Ctrl-D: dismiss"
+                    continue
+                subprocess.run(["makoctl", "menu", "-n", str(item["id"]), "fzf", "--prompt=Action > ", "--layout=reverse"])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"Notification center: {error}", file=sys.stderr)
+        sys.exit(1)

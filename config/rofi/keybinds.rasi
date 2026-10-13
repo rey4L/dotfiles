@@ -1,0 +1,6 @@
+/* Keybinding cheatsheet (dot-keybinds). Same look as the clipboard picker, text only. */
+@import "clipboard.rasi"
+
+configuration { show-icons: false; }
+window { width: 45%; }
+listview { lines: 16; }
