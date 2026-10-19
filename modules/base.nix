@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 {
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
@@ -38,6 +38,12 @@
 
   networking.networkmanager.enable = true;
   networking.firewall.enable = true;
+  # NetworkManager Wi-Fi hotspot on wlp7s0: let clients reach its dnsmasq
+  # for DHCP (67) and DNS (53), otherwise they hang on "connecting".
+  networking.firewall.interfaces.wlp7s0 = {
+    allowedUDPPorts = [ 53 67 ];
+    allowedTCPPorts = [ 53 ];
+  };
 
   # /etc/nixos points at this repo, so a bare `nixos-rebuild switch` or
   # `--flake /etc/nixos#jojen` builds the real config instead of a stale one.
@@ -48,6 +54,9 @@
     enable = true;
     gui.enable = true;
   };
+  # Do not start the daemon at boot (unlike tailscaled). Start on demand with
+  # `sudo systemctl start mullvad-daemon`; the GUI/CLI need it running.
+  systemd.services.mullvad-daemon.wantedBy = lib.mkForce [ ];
 
   i18n.defaultLocale = "en_US.UTF-8";
   i18n.supportedLocales = [ "en_US.UTF-8/UTF-8" ]; # not every locale (~220 MB)
