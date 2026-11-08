@@ -22,6 +22,7 @@
     fuzzel
     rofi # clipboard picker with image thumbnails (dot-clipboard)
     pamixer
+    pipewire.jack # pw-jack: run JACK apps on PipeWire (`pw-jack <app>`)
     playerctl
     wiremix
     bluetui

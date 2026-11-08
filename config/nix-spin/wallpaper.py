@@ -107,8 +107,8 @@ def mesh():
 
 
 def frame(points, normals, colors, angle):
-    """One frame at the given Y rotation: ASCII (list of ROWS strings) and a ROWS x COLS
-    colour-index grid."""
+    """One frame at the given Y rotation: visible cells (row * COLS + col), their RAMP
+    index, both sorted by colour, and the cell count per colour."""
     ca, sa = math.cos(angle), math.sin(angle)
     tilt = 0.14 + 0.10 * math.sin(angle)
     ct, st = math.cos(tilt), math.sin(tilt)
@@ -137,12 +137,11 @@ def frame(points, normals, colors, angle):
     order = np.lexsort((depth, cell))
     cell, lum, colors = cell[order], lum[order], colors[order]
     last = np.r_[cell[1:] != cell[:-1], True]
-    grid = np.full(COLS * ROWS, " ", dtype="<U1")
-    ramp = np.array(list(RAMP))
-    grid[cell[last]] = ramp[np.clip((lum[last] * (len(RAMP) - 1)).astype(int), 0, len(RAMP) - 1)]
-    shade = np.zeros(COLS * ROWS, np.uint8)
-    shade[cell[last]] = colors[last]
-    return ["".join(r) for r in grid.reshape(ROWS, COLS)], shade.reshape(ROWS, COLS)
+    cell, lum, colors = cell[last], lum[last], colors[last]
+    ch = np.clip((lum * (len(RAMP) - 1)).astype(int), 0, len(RAMP) - 1)
+    by = np.argsort(colors, kind="stable")
+    return (cell[by].astype(np.int16), ch[by].astype(np.uint8),
+            np.bincount(colors, minlength=len(COLORS)).tolist())
 
 
 def frames():
@@ -171,24 +170,22 @@ class Layout:
         # Glyph index per ramp char, so drawing skips text shaping entirely
         cr.set_font_size(size)
         sf = cr.get_scaled_font()
-        self.glyph = {c: sf.text_to_glyphs(0, 0, c, False)[0].index for c in RAMP}
+        self.glyph = np.array([sf.text_to_glyphs(0, 0, c, False)[0].index for c in RAMP])
 
     def draw(self, cr, frame):
-        """One show_glyphs call per colour; spaces are simply not emitted."""
-        lines, shade = frame
+        """One show_glyphs call per colour; glyphs built in one vectorised pass."""
+        cells, ch, counts = frame
         cr.select_font_face(FONT)
         cr.set_font_size(self.size)
-        x0, y0, adv, line, glyph = self.x, self.y + self.ascent, self.advance, self.line, self.glyph
-        runs = [[] for _ in COLORS]
-        for r, text in enumerate(lines):
-            row = shade[r]
-            for c, ch in enumerate(text):
-                if ch != " ":
-                    runs[row[c]].append(cairo.Glyph(glyph[ch], x0 + c * adv, y0 + r * line))
-        for rgb, glyphs in zip(COLORS, runs):
-            if glyphs:
+        xs = (self.x + cells % COLS * self.advance).tolist()
+        ys = (self.y + self.ascent + cells // COLS * self.line).tolist()
+        glyphs = list(map(cairo.Glyph, self.glyph[ch].tolist(), xs, ys))
+        start = 0
+        for rgb, n in zip(COLORS, counts):
+            if n:
                 cr.set_source_rgb(*rgb)
-                cr.show_glyphs(glyphs)
+                cr.show_glyphs(glyphs[start:start + n])
+            start += n
 
 
 def preview(path, angle):
@@ -285,7 +282,7 @@ def run():
         else:
             count = {ws["id"]: ws["windows"] for ws in wss}
             empty = {(m["x"], m["y"]) for m in mons
-                     if count.get(m["activeWorkspace"]["id"], 0) == 0 and m["specialWorkspace"]["id"] == 0}
+                     if count.get(m["activeWorkspace"]["id"], 0) == 0 and not m["specialWorkspace"].get("name")}
             visible.update(mon for mon in windows
                            if (mon.get_geometry().x, mon.get_geometry().y) in empty)
         if visible and not timer[0]:

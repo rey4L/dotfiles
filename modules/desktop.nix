@@ -58,7 +58,6 @@
     alsa.enable = true;
     alsa.support32Bit = true;
     pulse.enable = true;
-    jack.enable = true;
     wireplumber.enable = true;
     # Switch the graph to 44.1k for 44.1k content instead of resampling it
     extraConfig.pipewire."10-clock-rates" = {
