@@ -57,6 +57,8 @@
       NVD_BACKEND = lib.mkForce "";
       AQ_NO_HARDWARE_CURSORS = "1";
       WLR_NO_HARDWARE_CURSORS = "1";
+      # Read by config/hypr/hyprland.lua: software GL for clients + VM monitor mode.
+      DOT_VM = "1";
     };
   };
 

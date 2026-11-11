@@ -27,8 +27,13 @@ hl.config({
 ---------------- MONITORS ----------------
 -- hyprctl monitors  -> list outputs. 27" 1440p desktop display (Dell S2722DGM).
 local scale = 1.5
+-- DOT_VM is set only by the NixOS "vmware" specialisation; never on bare metal.
+local isVM = os.getenv("DOT_VM") == "1"
 
-hl.monitor({ output = "", mode = "highrr", position = "auto", scale = scale })
+-- In VMware "highrr" picks 800x600@60.32 over the 60.00 modes, so use the host-preferred mode at scale 1.
+hl.monitor({ output = "", mode = isVM and "preferred" or "highrr", position = "auto", scale = isVM and 1 or scale })
+-- vmwgfx: Hyprland drops clients that submit GPU (dmabuf) buffers; render clients on the CPU instead.
+if isVM then hl.env("LIBGL_ALWAYS_SOFTWARE", "1") end
 -- Second monitor example:
 -- hl.monitor({ output = "HDMI-A-1", mode = "2560x1440@60", position = "auto", scale = 1 })
 
