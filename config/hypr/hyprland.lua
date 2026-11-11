@@ -34,6 +34,8 @@ local isVM = os.getenv("DOT_VM") == "1"
 hl.monitor({ output = "", mode = isVM and "preferred" or "highrr", position = "auto", scale = isVM and 1 or scale })
 -- vmwgfx: Hyprland drops clients that submit GPU (dmabuf) buffers; render clients on the CPU instead.
 if isVM then hl.env("LIBGL_ALWAYS_SOFTWARE", "1") end
+-- vmwgfx: glamor makes Xwayland submit dmabufs too and Hyprland kills it; force software X.
+if isVM then hl.env("XWAYLAND_NO_GLAMOR", "1") end
 -- Second monitor example:
 -- hl.monitor({ output = "HDMI-A-1", mode = "2560x1440@60", position = "auto", scale = 1 })
 
