@@ -6,34 +6,51 @@ set -u
 
 action=${1:-}
 if [[ -z $action ]]; then
-  choice=$(printf 'Lock\nSuspend\nLog out\nRestart\nShut down\n' | fuzzel --dmenu --prompt='Power ' --lines=5 --width=30) || exit 0
+  choice=$(printf 'Lock\nSuspend\nLog out\nRestart\nWindows\nShut down\n' | fuzzel --dmenu --prompt='Power ' --lines=6 --width=30) || exit 0
   case $choice in
-    Lock) exec dot-lock ;;
-    Suspend) action=suspend ;;
-    'Log out') action=logout ;;
-    Restart) action=reboot ;;
-    'Shut down') action=poweroff ;;
-    *) exit 0 ;;
+  Lock) exec dot-lock ;;
+  Suspend) action=suspend ;;
+  'Log out') action=logout ;;
+  Restart) action=reboot ;;
+  Windows) action=windows ;;
+  'Shut down') action=poweroff ;;
+  *) exit 0 ;;
   esac
 fi
 case $action in
-  poweroff) label="Shut down" ;;
-  reboot) label="Restart" ;;
-  logout) label="Log out" ;;
-  suspend) label="Suspend" ;;
-  *) echo "Usage: dot-power [poweroff|reboot|logout|suspend]" >&2; exit 1 ;;
+poweroff) label="Shut down" ;;
+reboot) label="Restart" ;;
+windows) label="Boot Windows" ;;
+logout) label="Log out" ;;
+suspend) label="Suspend" ;;
+*)
+  echo "Usage: dot-power [poweroff|reboot|windows|logout|suspend]" >&2
+  exit 1
+  ;;
 esac
 
-choice=$(printf 'No\nYes, %s\n' "${label,}" | fuzzel --dmenu --prompt="$label? " --lines=2 --width=30) || exit 0
+choice=$(printf 'Yes, %s\nNo\n' "${label,}" | fuzzel --dmenu --prompt="$label? " --lines=2 --width=30) || exit 0
 [[ $choice == Yes* ]] || exit 0
 
-if [[ $action != suspend ]] && tmux has-session 2>/dev/null; then
-  tmux run-shell ~/.config/tmux/plugins/tmux-resurrect/scripts/save.sh
+if tmux has-session 2>/dev/null; then
+  ~/.local/bin/dot-agent-persist sync || true
+  if [[ $action != suspend ]]; then
+    ~/.config/tmux/plugins/tmux-resurrect/scripts/save.sh quiet >/dev/null 2>&1 || true
+  fi
 fi
 
 case $action in
-  poweroff) systemctl poweroff ;;
-  reboot) systemctl reboot ;;
-  logout) hyprctl dispatch 'hl.dsp.exit()' ;;
-  suspend) dot-lock; sleep 1; systemctl suspend ;; # give hyprlock time to grab the screen
+poweroff) systemctl poweroff ;;
+reboot) systemctl reboot ;;
+windows)
+  boot_id=$(efibootmgr | awk '/Windows Boot Manager/ { sub(/^Boot/, "", $1); sub(/\*.*/, "", $1); print $1; exit }')
+  sudo -n efibootmgr --bootnext "${boot_id:-0000}" >/dev/null
+  systemctl reboot
+  ;;
+logout) hyprctl dispatch 'hl.dsp.exit()' ;;
+suspend)
+  dot-lock
+  sleep 1
+  systemctl suspend
+  ;; # give hyprlock time to grab the screen
 esac

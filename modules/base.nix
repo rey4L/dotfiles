@@ -1,6 +1,12 @@
 { pkgs, lib, ... }:
 {
-  boot.loader.systemd-boot.enable = true;
+  # Lanzaboote replaces the systemd-boot module (still systemd-boot, but signed).
+  boot.loader.systemd-boot.enable = false;
+  boot.lanzaboote = {
+    enable = true;
+    pkiBundle = "/var/lib/sbctl"; # keys from `sudo sbctl create-keys`
+  };
+  environment.systemPackages = [ pkgs.sbctl ];
   boot.loader.efi.canTouchEfiVariables = true;
   boot.loader.systemd-boot.configurationLimit = 3; # boot menu: current + 2 previous builds
   zramSwap.enable = true;
@@ -67,6 +73,19 @@
     extraGroups = [ "wheel" "networkmanager" "docker" "video" "input" "audio" ];
     shell = pkgs.bash;
   };
+
+  # Allow dot-power (SUPER+O) to set one-shot UEFI BootNext for Windows without a password prompt.
+  security.sudo.extraRules = [
+    {
+      users = [ "rey" ];
+      commands = [
+        {
+          command = "/run/current-system/sw/bin/efibootmgr";
+          options = [ "NOPASSWD" ];
+        }
+      ];
+    }
+  ];
 
   services.openssh.enable = false;
   services.fwupd.enable = true;

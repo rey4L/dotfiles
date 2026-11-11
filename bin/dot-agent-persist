@@ -1,0 +1,1373 @@
+#!/usr/bin/env python3
+"""
+dot-agent-persist: Tmux Agent Suspend, Persistence & Lazy On-Focus Resume
+Supports: Claude Code (claude), Antigravity CLI (agy), Codex CLI (codex)
+"""
+
+from __future__ import annotations
+
+from contextlib import closing
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from typing import Any
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "tmux-agents"
+REGISTRY_PATH = STATE_DIR / "registry.json"
+LOCK_PATH = STATE_DIR / "registry.lock"
+
+CLAUDE_DIR = Path.home() / ".claude"
+AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
+CODEX_DIR = Path.home() / ".codex"
+
+SHELL_COMMANDS = {"bash", "zsh", "sh", "fish", "-bash", "-zsh", "-sh"}
+TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "Alacritty", "kitty", "foot"}
+VALID_CLAUDE_MODES = {"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
+DEFAULT_IDLE_TIMEOUT_MIN = 30
+HOSTNAME = os.uname().nodename
+
+FZF_COLORS = (
+    "--color=bg:#1e1e2e,fg:#cdd6f4,bg+:#313244,fg+:#89b4fa,"
+    "hl:#cba6f7,hl+:#cba6f7,border:#89b4fa,prompt:#89b4fa,header:#a6adc8"
+)
+
+
+def run_tmux(*args: str) -> str:
+    res = subprocess.run(
+        ["tmux", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def get_idle_timeout_sec() -> int:
+    val = run_tmux("show-option", "-gqv", "@agent-idle-timeout")
+    try:
+        mins = int(val) if val else DEFAULT_IDLE_TIMEOUT_MIN
+    except ValueError:
+        mins = DEFAULT_IDLE_TIMEOUT_MIN
+    return max(1, mins) * 60
+
+
+class RegistryLock:
+    def __init__(self) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.fd: int | None = None
+
+    def __enter__(self) -> RegistryLock:
+        self.fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def load_registry() -> dict[str, Any]:
+    try:
+        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("panes"), dict):
+            return data
+    except Exception:
+        pass
+    return {"server_pid": "", "panes": {}}
+
+
+def save_registry(reg: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = REGISTRY_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(reg, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(REGISTRY_PATH)
+
+
+def list_tmux_panes() -> tuple[str, list[dict[str, Any]]]:
+    """Returns (server_pid, panes) in a single tmux subprocess call."""
+    fmt = (
+        "#{pid}\t"
+        "#{session_name}:#{window_index}.#{pane_index}\t"
+        "#{pane_id}\t"
+        "#{pane_pid}\t"
+        "#{pane_current_command}\t"
+        "#{pane_title}\t"
+        "#{pane_current_path}\t"
+        "#{pane_tty}\t"
+        "#{session_name}:#{window_index}"
+    )
+    out = run_tmux("list-panes", "-a", "-F", fmt)
+    server_pid = ""
+    panes: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 9:
+            continue
+        server_pid = parts[0]
+        panes.append(
+            {
+                "locator": parts[1],
+                "pane_id": parts[2],
+                "pane_pid": int(parts[3]) if parts[3].isdigit() else 0,
+                "command": parts[4],
+                "title": parts[5],
+                "cwd": parts[6],
+                "tty": parts[7],
+                "window_locator": parts[8],
+            }
+        )
+    return server_pid, panes
+
+
+def get_active_client_windows_and_panes() -> tuple[set[str], set[str]]:
+    """Returns (active_window_locators, active_pane_ids) across attached tmux clients."""
+    out = run_tmux("list-clients", "-F", "#{session_name}:#{window_index}\t#{pane_id}")
+    win_locs: set[str] = set()
+    pane_ids: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2:
+            win_locs.add(parts[0])
+            pane_ids.add(parts[1])
+    return win_locs, pane_ids
+
+
+def get_child_processes(parent_pid: int) -> list[tuple[int, str, str]]:
+    """Fast child lookup across all threads via /proc/<pid>/task/*/children."""
+    if parent_pid <= 0:
+        return []
+    task_dir = Path(f"/proc/{parent_pid}/task")
+    raw_pids: list[str] = []
+    try:
+        for tid_dir in task_dir.iterdir():
+            try:
+                children_text = (tid_dir / "children").read_text().strip()
+                if children_text:
+                    raw_pids.extend(children_text.split())
+            except OSError:
+                continue
+    except OSError:
+        return []
+    children: list[tuple[int, str, str]] = []
+    for pid_str in raw_pids:
+        try:
+            pid = int(pid_str)
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="ignore").strip()
+            cmdline_raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            cmdline = cmdline_raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+            children.append((pid, comm, cmdline))
+        except (OSError, ValueError):
+            continue
+    return children
+
+
+def pane_children(pane: dict[str, Any]) -> list[tuple[int, str, str]]:
+    if "_children" not in pane:
+        pane["_children"] = get_child_processes(pane["pane_pid"])
+    return pane["_children"]
+
+
+def is_idle_shell(pane: dict[str, Any]) -> bool:
+    return (pane["command"] in SHELL_COMMANDS) and not pane_children(pane)
+
+
+def strip_title_decorations(title: str) -> str:
+    return re.sub(r"^[\s💤✳*]+", "", title).strip()
+
+
+def query_sqlite(db_path: Path, sql: str, params: tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
+    if not db_path.exists():
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)) as conn:
+            return conn.execute(sql, params).fetchone()
+    except Exception:
+        return None
+
+
+def find_fd_match(pid: int, pattern: str) -> str | None:
+    fd_dir = Path(f"/proc/{pid}/fd")
+    if not fd_dir.is_dir():
+        return None
+    for fd in fd_dir.iterdir():
+        try:
+            m = re.search(pattern, os.readlink(fd))
+            if m:
+                return m.group(1)
+        except OSError:
+            continue
+    return None
+
+
+def parse_claude_jsonl_metadata(jsonl_path: Path) -> dict[str, Any]:
+    """Extracts latest permissionMode and titles from a Claude session .jsonl file."""
+    titles: list[str] = []
+    mode: str | None = None
+    last_prompt: str | None = None
+    try:
+        size = jsonl_path.stat().st_size
+        with jsonl_path.open("rb") as f:
+            if size <= 327680:
+                chunks = [f.read().decode("utf-8", errors="ignore")]
+            else:
+                head = f.read(65536).decode("utf-8", errors="ignore")
+                f.seek(max(65536, size - 262144))
+                tail = f.read().decode("utf-8", errors="ignore")
+                chunks = [head, tail]
+
+        keywords = ("ai-title", "custom-title", "agent-name", "permission-mode", "permissionMode", "last-prompt")
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                if not any(k in line for k in keywords):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                t = obj.get("type")
+                if t == "permission-mode" and obj.get("permissionMode"):
+                    mode = obj["permissionMode"]
+                elif obj.get("permissionMode") and not mode:
+                    mode = obj["permissionMode"]
+                for t_key, v_key in (("custom-title", "customTitle"), ("ai-title", "aiTitle"), ("agent-name", "agentName")):
+                    if t == t_key and obj.get(v_key):
+                        titles.append(obj[v_key])
+                if t == "last-prompt" and obj.get("lastPrompt"):
+                    last_prompt = obj["lastPrompt"]
+    except Exception:
+        pass
+
+    return {
+        "mode": mode if mode in VALID_CLAUDE_MODES else None,
+        "title": titles[-1] if titles else (last_prompt[:50] if last_prompt else None),
+        "all_titles": set(titles),
+    }
+
+
+def inspect_live_claude(pane: dict[str, Any], agent_pid: int) -> dict[str, Any] | None:
+    sess_dir = CLAUDE_DIR / "sessions"
+    sess_data: dict[str, Any] | None = None
+    session_file = sess_dir / f"{agent_pid}.json"
+
+    if session_file.exists():
+        try:
+            sess_data = json.loads(session_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    elif sess_dir.is_dir():
+        for sf in sess_dir.glob("*.json"):
+            try:
+                d = json.loads(sf.read_text(encoding="utf-8"))
+                if d.get("tmux", "").endswith(f".{pane['pane_id']}") or d.get("pid") == agent_pid:
+                    sess_data = d
+                    break
+            except Exception:
+                continue
+
+    if not sess_data or not sess_data.get("sessionId"):
+        return None
+
+    session_id = sess_data["sessionId"]
+    cwd = sess_data.get("cwd") or pane["cwd"]
+    jsonl_path = CLAUDE_DIR / "projects" / re.sub(r"[^a-zA-Z0-9-]", "-", cwd) / f"{session_id}.jsonl"
+    meta = parse_claude_jsonl_metadata(jsonl_path) if jsonl_path.exists() else {}
+
+    clean_title = strip_title_decorations(pane["title"])
+    title = (
+        meta.get("title")
+        or (clean_title if clean_title and clean_title != HOSTNAME else None)
+        or sess_data.get("name")
+        or session_id[:8]
+    )
+    status = sess_data.get("status", "idle")
+    status_ms = sess_data.get("statusUpdatedAt") or sess_data.get("updatedAt") or int(time.time() * 1000)
+
+    return {
+        "agent": "claude",
+        "session_id": session_id,
+        "cwd": cwd,
+        "title": title,
+        "mode": meta.get("mode") or "auto",
+        "status": status,
+        "idle_since": float(status_ms) / 1000.0 if status == "idle" else time.time(),
+        "agent_pid": agent_pid,
+    }
+
+
+def inspect_live_agy(pane: dict[str, Any], agent_pid: int) -> dict[str, Any] | None:
+    conv_id = find_fd_match(agent_pid, r"/antigravity-cli/(?:presence|conversations)/([0-9a-fA-F-]{36})\.(?:lock|db)$")
+    if not conv_id:
+        return None
+
+    clean_title = strip_title_decorations(pane["title"])
+    title = clean_title if (clean_title and clean_title != HOSTNAME) else conv_id[:8]
+    row = query_sqlite(
+        AGY_DIR / "conversation_summaries.db",
+        "SELECT title, not_fully_idle FROM conversation_summaries WHERE conversation_id = ?",
+        (conv_id,),
+    )
+    is_busy = bool(row[1]) if row else False
+    if row and row[0]:
+        title = row[0]
+
+    conv_db = AGY_DIR / "conversations" / f"{conv_id}.db"
+    idle_since = conv_db.stat().st_mtime if conv_db.exists() else time.time()
+    if any("<defunct>" not in c[2] for c in get_child_processes(agent_pid)):
+        is_busy = True
+
+    return {
+        "agent": "agy",
+        "session_id": conv_id,
+        "cwd": pane["cwd"],
+        "title": title,
+        "mode": None,
+        "status": "busy" if is_busy else "idle",
+        "idle_since": time.time() if is_busy else idle_since,
+        "agent_pid": agent_pid,
+    }
+
+
+def inspect_live_codex(pane: dict[str, Any], agent_pid: int) -> dict[str, Any] | None:
+    session_id = find_fd_match(agent_pid, r"rollout-.*-([0-9a-fA-F-]{36})\.jsonl$")
+    title = strip_title_decorations(pane["title"])
+    idle_since = time.time()
+
+    db_path = CODEX_DIR / "state_5.sqlite"
+    if session_id:
+        row = query_sqlite(db_path, "SELECT id, title, updated_at FROM threads WHERE id = ?", (session_id,))
+    else:
+        row = query_sqlite(
+            db_path,
+            "SELECT id, title, updated_at FROM threads WHERE cwd = ? ORDER BY updated_at DESC LIMIT 1",
+            (pane["cwd"],),
+        )
+    if row:
+        session_id = row[0]
+        if row[1]:
+            title = row[1]
+        if row[2]:
+            idle_since = float(row[2])
+
+    if not session_id:
+        return None
+
+    is_busy = bool(get_child_processes(agent_pid))
+    return {
+        "agent": "codex",
+        "session_id": session_id,
+        "cwd": pane["cwd"],
+        "title": title or session_id[:8],
+        "mode": None,
+        "status": "busy" if is_busy else "idle",
+        "idle_since": time.time() if is_busy else idle_since,
+        "agent_pid": agent_pid,
+    }
+
+
+def find_live_agent_in_pane(pane: dict[str, Any]) -> dict[str, Any] | None:
+    for pid, comm, cmdline in pane_children(pane):
+        base_arg = os.path.basename(cmdline.split()[0]) if cmdline else ""
+        names = {comm, base_arg}
+        if names & {"claude", ".claude-wrapped"}:
+            return inspect_live_claude(pane, pid)
+        if "agy" in names:
+            return inspect_live_agy(pane, pid)
+        if "codex" in names:
+            return inspect_live_codex(pane, pid)
+    return None
+
+
+def recover_agent_by_title(pane: dict[str, Any], claimed_sids: set[str]) -> dict[str, Any] | None:
+    """Self-healing discovery: matches a pane title with ✳ or 💤 back to its Claude/AGY/Codex session."""
+    raw_title = pane["title"]
+    if "✳" not in raw_title and "💤" not in raw_title:
+        return None
+    target_title = strip_title_decorations(raw_title)
+    if not target_title:
+        return None
+
+    cwd = pane["cwd"]
+    proj_dir = CLAUDE_DIR / "projects" / re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
+    if proj_dir.is_dir():
+        jsonl_files = sorted(proj_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        exact: tuple[str, dict[str, Any]] | None = None
+        partial: tuple[str, dict[str, Any]] | None = None
+        for jf in jsonl_files:
+            sid = jf.stem
+            meta = parse_claude_jsonl_metadata(jf)
+            all_titles = meta.get("all_titles", set())
+            if target_title in all_titles:
+                exact = (sid, meta)
+                if sid not in claimed_sids:
+                    break
+            elif not partial and any(target_title.lower() in t.lower() or t.lower() in target_title.lower() for t in all_titles):
+                partial = (sid, meta)
+
+        chosen = exact or partial
+        if chosen:
+            sid, meta = chosen
+            return {
+                "agent": "claude",
+                "session_id": sid,
+                "cwd": cwd,
+                "title": target_title,
+                "mode": meta.get("mode") or "auto",
+            }
+
+    for agent, db_path, sql in (
+        (
+            "agy",
+            AGY_DIR / "conversation_summaries.db",
+            "SELECT conversation_id, title FROM conversation_summaries WHERE title = ? ORDER BY last_modified_time DESC LIMIT 1",
+        ),
+        (
+            "codex",
+            CODEX_DIR / "state_5.sqlite",
+            "SELECT id, title FROM threads WHERE title = ? ORDER BY updated_at DESC LIMIT 1",
+        ),
+    ):
+        row = query_sqlite(db_path, sql, (target_title,))
+        if row and row[0]:
+            return {
+                "agent": agent,
+                "session_id": row[0],
+                "cwd": cwd,
+                "title": row[1] or target_title,
+                "mode": None,
+            }
+    return None
+
+
+def build_resume_command(entry: dict[str, Any]) -> str:
+    agent = entry["agent"]
+    sid = shlex.quote(entry["session_id"])
+    if agent == "claude":
+        mode = entry.get("mode")
+        if mode in VALID_CLAUDE_MODES:
+            return f"claude --resume {sid} --permission-mode {shlex.quote(mode)}"
+        return f"claude --resume {sid}"
+    if agent == "agy":
+        return f"agy --conversation {sid}"
+    if agent == "codex":
+        return f"codex resume {sid}"
+    return ""
+
+
+def write_suspended_banner(tty: str, entry: dict[str, Any]) -> None:
+    if not tty or not os.path.exists(tty):
+        return
+    try:
+        agent = entry["agent"]
+        title = entry.get("title") or entry["session_id"][:8]
+        sid_short = entry["session_id"][:8]
+        mode_str = f" ({entry['mode']})" if entry.get("mode") else ""
+        banner = (
+            "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[<u\033[?25h"
+            "\033[2J\033[3J\033[H"
+            f"\033[38;2;166;173;200m💤 Suspended \033[1;38;2;203;166;247m[{agent}{mode_str}]\033[0;38;2;166;173;200m "
+            f"\033[1;38;2;205;214;244m{title}\033[0;38;2;108;112;134m ({sid_short}) "
+            f"— focus window or press \033[38;2;249;226;175mPrefix+s\033[38;2;108;112;134m to resume\033[0m\r\n"
+        )
+        with open(tty, "wb", buffering=0) as f:
+            f.write(banner.encode("utf-8"))
+    except OSError:
+        pass
+
+
+def set_pane_title_for_state(pane: dict[str, Any], entry: dict[str, Any]) -> None:
+    title = strip_title_decorations(entry.get("title") or entry["session_id"][:8])
+    formatted = f"💤 ✳ {title}" if entry.get("state") == "suspended" else f"✳ {title}"
+    if pane.get("title") != formatted:
+        run_tmux("select-pane", "-t", pane["pane_id"], "-T", formatted)
+        pane["title"] = formatted
+
+
+def sync_registry(
+    force_post_restore: bool = False,
+    panes_info: tuple[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    server_pid, live_panes = panes_info if panes_info is not None else list_tmux_panes()
+    if not server_pid:
+        return {"server_pid": "", "panes": {}}, []
+
+    reg = load_registry()
+    same_server = (reg.get("server_pid") == server_pid) and not force_post_restore
+    old_panes: dict[str, dict[str, Any]] = reg.get("panes", {})
+
+    by_pane_id = {e["pane_id"]: e for e in old_panes.values() if same_server and e.get("pane_id")}
+    claimed_sids = {e["session_id"] for e in old_panes.values() if e.get("session_id")}
+    new_panes: dict[str, dict[str, Any]] = {}
+
+    for pane in live_panes:
+        loc = pane["locator"]
+        pid_id = pane["pane_id"]
+        live_info = find_live_agent_in_pane(pane)
+
+        if live_info:
+            prev = by_pane_id.get(pid_id) or old_panes.get(loc) or {}
+            entry = {
+                "locator": loc,
+                "pane_id": pid_id,
+                "agent": live_info["agent"],
+                "session_id": live_info["session_id"],
+                "cwd": live_info["cwd"],
+                "title": live_info["title"],
+                "mode": live_info.get("mode") or prev.get("mode"),
+                "state": "running",
+                "status": live_info.get("status", "idle"),
+                "idle_since": live_info.get("idle_since", time.time()),
+                "updated_at": time.time(),
+                "manual_suspend": False,
+            }
+            new_panes[loc] = entry
+            claimed_sids.add(live_info["session_id"])
+            if live_info["agent"] in ("agy", "codex") and not pane["title"].startswith("✳"):
+                set_pane_title_for_state(pane, entry)
+            continue
+
+        if not is_idle_shell(pane):
+            continue
+
+        prev = (by_pane_id.get(pid_id) if same_server else None) or old_panes.get(loc)
+        if prev:
+            entry = {
+                **prev,
+                "locator": loc,
+                "pane_id": pid_id,
+                "state": "suspended",
+                "manual_suspend": False if force_post_restore else bool(prev.get("manual_suspend")),
+            }
+            new_panes[loc] = entry
+            set_pane_title_for_state(pane, entry)
+            continue
+
+        recovered = recover_agent_by_title(pane, claimed_sids)
+        if recovered:
+            entry = {
+                "locator": loc,
+                "pane_id": pid_id,
+                "agent": recovered["agent"],
+                "session_id": recovered["session_id"],
+                "cwd": recovered["cwd"],
+                "title": recovered["title"],
+                "mode": recovered["mode"],
+                "state": "suspended",
+                "status": "idle",
+                "idle_since": time.time(),
+                "updated_at": time.time(),
+                "manual_suspend": False,
+            }
+            new_panes[loc] = entry
+            claimed_sids.add(recovered["session_id"])
+            set_pane_title_for_state(pane, entry)
+
+    updated = {"server_pid": server_pid, "panes": new_panes}
+    save_registry(updated)
+    return updated, live_panes
+
+
+def wake_pane_entry(pane: dict[str, Any], entry: dict[str, Any], reg: dict[str, Any], force: bool = False) -> bool:
+    if entry.get("state") != "suspended":
+        return False
+    if entry.get("manual_suspend") and not force:
+        return False
+
+    now = time.time()
+    if not force and (now - float(entry.get("last_woken_at", 0))) < 5.0:
+        return False
+    if not is_idle_shell(pane):
+        return False
+
+    resume_cmd = build_resume_command(entry)
+    if not resume_cmd:
+        return False
+
+    tty = pane.get("tty")
+    if tty and os.path.exists(tty):
+        try:
+            with open(tty, "wb", buffering=0) as f:
+                f.write(b"\033[2J\033[3J\033[H")
+        except OSError:
+            pass
+
+    entry.update(
+        locator=pane["locator"],
+        pane_id=pane["pane_id"],
+        state="running",
+        manual_suspend=False,
+        last_woken_at=now,
+        updated_at=now,
+    )
+    reg["panes"][pane["locator"]] = entry
+    save_registry(reg)
+
+    set_pane_title_for_state(pane, entry)
+    run_tmux("send-keys", "-t", pane["pane_id"], "C-u", f" {resume_cmd}", "C-m")
+    return True
+
+
+def suspend_pane_entry(pane: dict[str, Any], reg: dict[str, Any], manual: bool = False) -> bool:
+    live_info = find_live_agent_in_pane(pane)
+    if not live_info:
+        return False
+
+    loc = pane["locator"]
+    prev = reg.get("panes", {}).get(loc)
+    entry = {
+        "locator": loc,
+        "pane_id": pane["pane_id"],
+        "agent": live_info["agent"],
+        "session_id": live_info["session_id"],
+        "cwd": live_info["cwd"],
+        "title": live_info["title"],
+        "mode": live_info.get("mode") or (prev.get("mode") if prev else None),
+        "state": "suspended",
+        "status": "idle",
+        "idle_since": time.time(),
+        "updated_at": time.time(),
+        "manual_suspend": manual,
+    }
+    reg.setdefault("panes", {})[loc] = entry
+    save_registry(reg)
+
+    agent_pid = live_info["agent_pid"]
+    try:
+        os.kill(agent_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not Path(f"/proc/{agent_pid}").exists():
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(agent_pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        time.sleep(0.1)
+
+    set_pane_title_for_state(pane, entry)
+    write_suspended_banner(pane["tty"], entry)
+    return True
+
+
+def cmd_wake(target: str | None = None, force: bool = False) -> int:
+    """Fast-path wake on window/pane focus: avoids full sync_registry when no focused pane is suspended."""
+    server_pid, panes = list_tmux_panes()
+    if not panes:
+        return 0
+
+    if target:
+        candidates = [p for p in panes if p["locator"] == target or p["pane_id"] == target]
+        active_pane_ids = {p["pane_id"] for p in candidates}
+    else:
+        active_wins, active_pane_ids = get_active_client_windows_and_panes()
+        candidates = [p for p in panes if p["window_locator"] in active_wins or p["pane_id"] in active_pane_ids]
+
+    idle_candidates = [p for p in candidates if is_idle_shell(p)]
+    if not idle_candidates:
+        return 0
+
+    reg = load_registry()
+    same_server = reg.get("server_pid") == server_pid
+    by_pane_id = {e["pane_id"]: e for e in reg.get("panes", {}).values() if same_server and e.get("pane_id")}
+
+    needs_action = any(
+        (by_pane_id.get(p["pane_id"]) or reg["panes"].get(p["locator"]) or {}).get("state") == "suspended"
+        or "💤" in p["title"]
+        or "✳" in p["title"]
+        for p in idle_candidates
+    )
+    if not needs_action:
+        return 0
+
+    with RegistryLock():
+        reg = load_registry()
+        same_server = reg.get("server_pid") == server_pid
+        by_pane_id = {e["pane_id"]: e for e in reg.get("panes", {}).values() if same_server and e.get("pane_id")}
+        claimed_sids = {e["session_id"] for e in reg.get("panes", {}).values() if e.get("session_id")}
+
+        for p in idle_candidates:
+            entry = by_pane_id.get(p["pane_id"]) or reg["panes"].get(p["locator"])
+            if not entry:
+                recovered = recover_agent_by_title(p, claimed_sids)
+                if not recovered:
+                    continue
+                entry = {
+                    **recovered,
+                    "locator": p["locator"],
+                    "pane_id": p["pane_id"],
+                    "state": "suspended",
+                    "status": "idle",
+                    "idle_since": time.time(),
+                    "updated_at": time.time(),
+                    "manual_suspend": False,
+                }
+                reg.setdefault("panes", {})[p["locator"]] = entry
+
+            if entry.get("state") != "suspended":
+                continue
+
+            if not target and entry.get("manual_suspend") and p["pane_id"] in active_pane_ids:
+                if time.time() - float(entry.get("updated_at", 0)) > 3.0:
+                    wake_pane_entry(p, entry, reg, force=True)
+            else:
+                wake_pane_entry(p, entry, reg, force=force)
+    return 0
+
+
+def cmd_suspend_idle() -> int:
+    timeout_sec = get_idle_timeout_sec()
+    now = time.time()
+    with RegistryLock():
+        reg, panes = sync_registry(force_post_restore=False)
+        active_wins, active_pane_ids = get_active_client_windows_and_panes()
+
+        for p in panes:
+            if p["window_locator"] in active_wins or p["pane_id"] in active_pane_ids:
+                continue
+            entry = reg["panes"].get(p["locator"])
+            if entry and entry.get("state") == "running" and entry.get("status") == "idle":
+                if (now - float(entry.get("idle_since", now))) >= timeout_sec:
+                    suspend_pane_entry(p, reg, manual=False)
+    return 0
+
+
+def cmd_toggle(target: str | None = None) -> int:
+    if not target:
+        target = run_tmux("display-message", "-p", "#{pane_id}")
+    with RegistryLock():
+        reg, panes = sync_registry(force_post_restore=False)
+        p = next((x for x in panes if x["locator"] == target or x["pane_id"] == target), None)
+        if not p:
+            return 1
+
+        entry = reg["panes"].get(p["locator"])
+        if entry and entry.get("state") == "suspended":
+            wake_pane_entry(p, entry, reg, force=True)
+            run_tmux("display-message", f"Resumed [{entry['agent']}] {entry.get('title', '')}")
+        elif entry and entry.get("state") == "running":
+            if suspend_pane_entry(p, reg, manual=True):
+                run_tmux("display-message", f"💤 Suspended [{entry['agent']}] {entry.get('title', '')}")
+        else:
+            run_tmux("display-message", "No resumable agent tracked in this pane")
+    return 0
+
+
+def cmd_post_restore() -> int:
+    with RegistryLock():
+        reg, panes = sync_registry(force_post_restore=True)
+        active_wins, _ = get_active_client_windows_and_panes()
+        for p in panes:
+            entry = reg["panes"].get(p["locator"])
+            if entry and entry.get("state") == "suspended":
+                set_pane_title_for_state(p, entry)
+                if p["window_locator"] not in active_wins:
+                    write_suspended_banner(p["tty"], entry)
+    return cmd_wake(force=True)
+
+
+def cmd_status() -> int:
+    with RegistryLock():
+        reg, _ = sync_registry(force_post_restore=False)
+    panes = reg.get("panes", {})
+    if not panes:
+        print("No tracked agent panes.")
+        return 0
+
+    print(f"{'PANE':<24} {'ID':<5} {'STATE':<12} {'AGENT':<14} {'SESSION':<10} {'TITLE'}")
+    print("-" * 96)
+    for loc in sorted(panes):
+        e = panes[loc]
+        state = "💤 suspended" if e.get("state") == "suspended" else "● running"
+        mode = f"({e['mode']})" if e.get("mode") else ""
+        agent_col = f"{e.get('agent', '')} {mode}".strip()
+        sid_short = (e.get("session_id") or "")[:8]
+        print(f"{loc:<24} {e.get('pane_id', ''):<5} {state:<12} {agent_col:<14} {sid_short:<10} {e.get('title', '')}")
+    return 0
+
+
+def ensure_tmux_server() -> None:
+    res = subprocess.run(["tmux", "has-session"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if res.returncode == 0:
+        return
+    restore_script = Path.home() / ".config/tmux/plugins/tmux-continuum/scripts/continuum_restore.sh"
+    subprocess.run(
+        ["tmux", "start-server", ";", "run-shell", str(restore_script)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    for _ in range(20):
+        if subprocess.run(["tmux", "has-session"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
+            break
+        time.sleep(0.1)
+
+
+def get_tmux_session_choices(exclude_session: str | None = None) -> list[tuple[str, str, str]]:
+    """Returns list of (action_mode, session_name, display_label)."""
+    win_out = run_tmux("list-windows", "-a", "-F", "#{session_name}\t#{window_name}\t#{window_active}")
+    sess_out = run_tmux("list-sessions", "-F", "#{session_name}\t#{session_windows}\t#{session_attached}")
+
+    wins_by_sess: dict[str, list[str]] = {}
+    active_win_by_sess: dict[str, str] = {}
+    for line in win_out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        s, w, act = parts[0], parts[1], parts[2]
+        if w not in wins_by_sess.setdefault(s, []):
+            wins_by_sess[s].append(w)
+        if act == "1":
+            active_win_by_sess[s] = w
+
+    choices: list[tuple[str, str, str]] = []
+    split_choices: list[tuple[str, str, str]] = []
+    for line in sess_out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        s, count_str, att_str = parts[0], parts[1], parts[2]
+        w_label = "1 window" if count_str == "1" else f"{count_str} windows"
+        att_label = " (attached)" if int(att_str) > 0 else ""
+        w_names = ", ".join(wins_by_sess.get(s, []))
+        info = f" [{w_names}]" if w_names else ""
+        if s != exclude_session:
+            choices.append(("window", s, f"{s}: {w_label}{info}{att_label}"))
+        act_w = active_win_by_sess.get(s, "")
+        act_info = f" [{act_w}]" if act_w else ""
+        split_choices.append(("split", s, f"{s} [split]: join active window{act_info}{att_label}"))
+
+    choices.extend(split_choices)
+    choices.append(("new", "", "+ new session"))
+    return choices
+
+
+def pick_destination_session(use_fzf: bool = False, exclude_session: str | None = None) -> tuple[str, str] | None:
+    """Prompts user via fuzzel (or fzf in TUI) and returns (mode, session_name) where mode is 'window' or 'split'."""
+    choices = get_tmux_session_choices(exclude_session=exclude_session)
+    if use_fzf:
+        rows = [f"{mode}:{sess}\t{label}" for mode, sess, label in choices]
+        res = subprocess.run(
+            [
+                "fzf",
+                "--delimiter=\t",
+                "--with-nth=2..",
+                "--layout=reverse",
+                "--border=rounded",
+                "--prompt=Move to session > ",
+                "--header=Enter: select target session (window or split) | Esc: cancel",
+                "--no-multi",
+                FZF_COLORS,
+            ],
+            input="\n".join(rows),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        key = res.stdout.splitlines()[0].split("\t", 1)[0]
+        mode, _, sess = key.partition(":")
+        if mode == "new":
+            name_res = subprocess.run(
+                [
+                    "fzf",
+                    "--print-query",
+                    "--layout=reverse",
+                    "--border=rounded",
+                    "--prompt=New session name (default Work) > ",
+                    FZF_COLORS,
+                ],
+                input="",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            sess = (name_res.stdout.splitlines()[0].strip() if name_res.stdout else "") or "Work"
+            return ("window", sess)
+        return (mode, sess)
+
+    labels = [label for _, _, label in choices]
+    lines = min(12, max(1, len(labels)))
+    res = subprocess.run(
+        ["fuzzel", "--dmenu", "--prompt=adopt → tmux ", "--width=64", f"--lines={lines}"],
+        input="\n".join(labels),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    picked = res.stdout.strip()
+    match = next(((m, s) for m, s, lbl in choices if lbl == picked), None)
+    if not match:
+        return None
+    mode, sess = match
+    if mode == "new":
+        name_res = subprocess.run(
+            ["fuzzel", "--dmenu", "--prompt=name ", "--lines=0"],
+            input="",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if name_res.returncode != 0:
+            return None
+        sess = name_res.stdout.strip() or "Work"
+        return ("window", sess)
+    return (mode, sess)
+
+
+def get_active_hypr_window() -> dict[str, Any] | None:
+    res = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, check=False)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        data = json.loads(res.stdout)
+        return data if isinstance(data, dict) and data.get("pid") else None
+    except Exception:
+        return None
+
+
+def focus_or_open_tmux_session(session_name: str, cwd: str) -> None:
+    """Focuses an existing Ghostty client attached to session_name, or opens a new one."""
+    clients_out = run_tmux("list-clients", "-t", session_name, "-F", "#{client_pid}")
+    client_pids = {int(p) for p in clients_out.splitlines() if p.strip().isdigit()}
+
+    if client_pids:
+        hypr_res = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, check=False)
+        if hypr_res.returncode == 0 and hypr_res.stdout.strip():
+            try:
+                clients = json.loads(hypr_res.stdout)
+                for c in clients:
+                    w_pid = int(c.get("pid") or 0)
+                    if w_pid <= 0:
+                        continue
+                    child_pids = {pid for pid, _, _ in get_child_processes(w_pid)}
+                    grandchild_pids = {
+                        gpid for cpid in child_pids for gpid, _, _ in get_child_processes(cpid)
+                    }
+                    if client_pids & (child_pids | grandchild_pids):
+                        addr = c.get("address")
+                        if addr:
+                            subprocess.run(
+                                ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{addr}" }})'],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                            )
+                        return
+            except Exception:
+                pass
+        return
+
+    subprocess.Popen(
+        ["setsid", "ghostty", f"--working-directory={cwd}", "-e", "tmux", "new-session", "-A", "-s", session_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def resolve_adopt_source(target_arg: str | None, active_win: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Identifies whether the source to adopt is a tmux pane or a bare terminal window."""
+    if target_arg:
+        return {"kind": "tmux_pane", "target": target_arg}
+
+    # Map active tmux clients by PID so we can detect if the focused Ghostty window is already inside tmux
+    client_map: dict[int, tuple[str, str]] = {}
+    for line in run_tmux("list-clients", "-F", "#{client_pid}\t#{pane_id}\t#{session_name}").splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].isdigit():
+            client_map[int(parts[0])] = (parts[1], parts[2])
+
+    if active_win and int(active_win.get("pid", 0)) > 0:
+        if str(active_win.get("class") or "") not in TERMINAL_CLASSES:
+            return None
+        win_pid = int(active_win["pid"])
+        children = get_child_processes(win_pid)
+        for cpid, comm, _ in children:
+            if cpid in client_map:
+                pane_id, sess = client_map[cpid]
+                return {"kind": "tmux_pane", "target": pane_id, "session": sess}
+            for gpid, gcomm, _ in get_child_processes(cpid):
+                if gpid in client_map:
+                    pane_id, sess = client_map[gpid]
+                    return {"kind": "tmux_pane", "target": pane_id, "session": sess}
+
+        # Only ever adopt (and later SIGHUP) a real shell; a non-terminal window's children are not ours to kill
+        shell_pid = next((cpid for cpid, comm, _ in reversed(children) if comm in SHELL_COMMANDS), None)
+        if shell_pid:
+            try:
+                cwd = os.readlink(f"/proc/{shell_pid}/cwd")
+            except OSError:
+                cwd = str(Path.home())
+            try:
+                tty = os.readlink(f"/proc/{shell_pid}/fd/0")
+            except OSError:
+                tty = ""
+            pseudo_pane = {
+                "locator": "",
+                "pane_id": "",
+                "pane_pid": shell_pid,
+                "command": "bash",
+                "title": str(active_win.get("title") or ""),
+                "cwd": cwd,
+                "tty": tty,
+                "window_locator": "",
+            }
+            live_info = find_live_agent_in_pane(pseudo_pane)
+            return {
+                "kind": "bare_terminal",
+                "shell_pid": shell_pid,
+                "win_addr": active_win.get("address"),
+                "cwd": live_info["cwd"] if live_info else cwd,
+                "live_info": live_info,
+            }
+        return None
+
+    if os.environ.get("TMUX_PANE"):
+        return {"kind": "tmux_pane", "target": os.environ["TMUX_PANE"]}
+
+    # Fallback when invoked from a bare shell CLI without hyprctl
+    # Only when the parent is a shell: from a Hyprland keybind the parent is Hyprland itself, and the final
+    # SIGHUP to shell_pid would kill the compositor
+    ppid = os.getppid()
+    try:
+        ppid_comm = Path(f"/proc/{ppid}/comm").read_text().strip()
+    except OSError:
+        ppid_comm = ""
+    if ppid > 1 and ppid_comm in SHELL_COMMANDS:
+        try:
+            cwd = os.readlink(f"/proc/{ppid}/cwd")
+        except OSError:
+            cwd = os.getcwd()
+        try:
+            tty = os.readlink(f"/proc/{ppid}/fd/0")
+        except OSError:
+            tty = ""
+        # Must be an interactive shell on a real terminal (not e.g. Hyprland's `sh -c` exec wrapper)
+        if not tty.startswith("/dev/pts/"):
+            return None
+        pseudo_pane = {
+            "locator": "",
+            "pane_id": "",
+            "pane_pid": ppid,
+            "command": "bash",
+            "title": "",
+            "cwd": cwd,
+            "tty": tty,
+            "window_locator": "",
+        }
+        live_info = find_live_agent_in_pane(pseudo_pane)
+        return {
+            "kind": "bare_terminal",
+            "shell_pid": ppid,
+            "win_addr": None,
+            "cwd": live_info["cwd"] if live_info else cwd,
+            "live_info": live_info,
+        }
+
+    return None
+
+
+def move_tmux_pane_to_session(target: str, dest_sess: str, mode: str) -> str | None:
+    """Moves or joins an existing tmux pane into dest_sess without restarting its process."""
+    with RegistryLock():
+        _, panes = sync_registry(force_post_restore=False)
+        p = next((x for x in panes if x["locator"] == target or x["pane_id"] == target), None)
+        if not p:
+            return None
+        pane_id = p["pane_id"]
+
+    has_dest = subprocess.run(
+        ["tmux", "has-session", "-t", dest_sess],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+    if not has_dest:
+        run_tmux("new-session", "-d", "-s", dest_sess, "-c", p["cwd"])
+
+    if mode == "split":
+        run_tmux("join-pane", "-h", "-p", "30", "-s", pane_id, "-t", f"{dest_sess}:")
+    else:
+        win_panes = run_tmux("display-message", "-p", "-t", pane_id, "#{window_panes}")
+        if win_panes.isdigit() and int(win_panes) > 1:
+            run_tmux("break-pane", "-s", pane_id, "-t", f"{dest_sess}:")
+        else:
+            run_tmux("move-window", "-s", p["window_locator"], "-t", f"{dest_sess}:")
+
+    with RegistryLock():
+        sync_registry(force_post_restore=False)
+    run_tmux("select-pane", "-t", pane_id)
+    cmd_wake(target=pane_id, force=True)
+    return pane_id
+
+
+def cmd_adopt(
+    target_arg: str | None = None,
+    dest_sess: str | None = None,
+    mode: str = "window",
+    use_fzf: bool = False,
+) -> int:
+    if not dest_sess and not use_fzf:
+        if subprocess.run(["pkill", "-x", "fuzzel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
+            return 0
+    active_win = get_active_hypr_window() if not target_arg and not use_fzf else None
+    if active_win and str(active_win.get("class") or "") not in TERMINAL_CLASSES:
+        return 0
+    ensure_tmux_server()
+
+    src = resolve_adopt_source(target_arg, active_win)
+    if not src:
+        run_tmux("display-message", "Could not detect terminal or tmux pane to adopt")
+        return 1
+
+    exclude_sess = src.get("session") if src["kind"] == "tmux_pane" else None
+    if not dest_sess:
+        picked = pick_destination_session(use_fzf=use_fzf, exclude_session=exclude_sess)
+        if not picked:
+            return 0
+        mode, dest_sess = picked
+
+    if src["kind"] == "tmux_pane":
+        pane_id = move_tmux_pane_to_session(src["target"], dest_sess, mode)
+        if not pane_id:
+            return 1
+        win_loc = run_tmux("display-message", "-p", "-t", pane_id, "#{session_name}:#{window_index}")
+        run_tmux("switch-client", "-t", dest_sess)
+        if win_loc:
+            run_tmux("select-window", "-t", win_loc)
+        run_tmux("select-pane", "-t", pane_id)
+        if not use_fzf:
+            focus_or_open_tmux_session(dest_sess, str(Path.home()))
+        return 0
+
+    # Bare terminal adoption (e.g., standalone Ghostty running agy, claude, codex, or bash)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    cwd = src["cwd"]
+    live_info = src.get("live_info")
+    shell_pid = int(src["shell_pid"])
+
+    has_dest = subprocess.run(
+        ["tmux", "has-session", "-t", dest_sess],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+    fmt = "#{session_name}:#{window_index}.#{pane_index}\t#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}"
+    if not has_dest:
+        out = run_tmux("new-session", "-d", "-s", dest_sess, "-c", cwd, "-P", "-F", fmt)
+    elif mode == "split":
+        out = run_tmux("split-window", "-h", "-p", "30", "-t", f"{dest_sess}:", "-c", cwd, "-P", "-F", fmt)
+    else:
+        out = run_tmux("new-window", "-t", f"{dest_sess}:", "-c", cwd, "-P", "-F", fmt)
+
+    parts = out.split("\t")
+    if len(parts) < 4:
+        return 1
+    new_loc, new_pane_id, new_tty, new_win_loc = parts[0], parts[1], parts[2], parts[3]
+
+    if live_info:
+        agent_pid = int(live_info["agent_pid"])
+        try:
+            os.kill(agent_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if not Path(f"/proc/{agent_pid}").exists():
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(agent_pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
+            time.sleep(0.1)
+
+        entry = {
+            "locator": new_loc,
+            "pane_id": new_pane_id,
+            "agent": live_info["agent"],
+            "session_id": live_info["session_id"],
+            "cwd": cwd,
+            "title": live_info["title"],
+            "mode": live_info.get("mode"),
+            "state": "running",
+            "status": "idle",
+            "idle_since": time.time(),
+            "updated_at": time.time(),
+            "manual_suspend": False,
+        }
+        with RegistryLock():
+            reg = load_registry()
+            reg.setdefault("panes", {})[new_loc] = entry
+            save_registry(reg)
+
+        pane_stub = {"pane_id": new_pane_id, "title": "", "tty": new_tty}
+        set_pane_title_for_state(pane_stub, entry)
+        resume_cmd = build_resume_command(entry)
+        if resume_cmd:
+            run_tmux("send-keys", "-t", new_pane_id, "C-u", f" {resume_cmd}", "C-m")
+
+    run_tmux("select-window", "-t", new_win_loc)
+    run_tmux("select-pane", "-t", new_pane_id)
+    focus_or_open_tmux_session(dest_sess, cwd)
+
+    try:
+        shell_comm = Path(f"/proc/{shell_pid}/comm").read_text(encoding="utf-8", errors="ignore").strip()
+        if shell_pid > 1 and shell_comm in SHELL_COMMANDS:
+            os.kill(shell_pid, signal.SIGHUP)
+    except OSError:
+        pass
+    return 0
+
+
+def cmd_tui() -> int:
+    header = "Enter: jump & resume | Ctrl-S: toggle | Ctrl-M: move to session | Ctrl-Z: suspend idle"
+    home = str(Path.home())
+    while True:
+        with RegistryLock():
+            reg, _ = sync_registry(force_post_restore=False)
+        panes = reg.get("panes", {})
+        if not panes:
+            run_tmux("display-message", "No tracked agent panes")
+            return 0
+
+        rows: list[str] = []
+        for loc in sorted(panes):
+            e = panes[loc]
+            icon = "💤" if e.get("state") == "suspended" else "🟢"
+            mode = f" ({e['mode']})" if e.get("mode") else ""
+            agent_tag = f"[{e.get('agent', '')}{mode}]"
+            cwd = (e.get("cwd") or "").replace(home, "~", 1)
+            title = e.get("title") or e.get("session_id", "")[:8]
+            rows.append(f"{loc}\t{icon} {loc:<22} {agent_tag:<16} {title}  ({cwd})")
+
+        res = subprocess.run(
+            [
+                "fzf",
+                "--delimiter=\t",
+                "--with-nth=2..",
+                "--layout=reverse",
+                "--border=rounded",
+                "--prompt=Agents > ",
+                f"--header={header}",
+                "--expect=ctrl-s,ctrl-z,ctrl-m",
+                "--no-multi",
+                FZF_COLORS,
+            ],
+            input="\n".join(rows),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return 0
+
+        lines = res.stdout.splitlines()
+        if len(lines) < 2:
+            return 0
+        action, loc = lines[0], lines[1].split("\t", 1)[0]
+
+        if action == "ctrl-s":
+            cmd_toggle(loc)
+            continue
+        if action == "ctrl-z":
+            cmd_suspend_idle()
+            continue
+        if action == "ctrl-m":
+            entry = panes.get(loc, {})
+            cmd_adopt(target_arg=entry.get("pane_id", loc), use_fzf=True)
+            return 0
+
+        # Enter: switch to session/window/pane and wake it
+        sess_win, _, _ = loc.partition(".")
+        sess, _, _ = sess_win.partition(":")
+        entry = panes.get(loc, {})
+        pane_id = entry.get("pane_id", loc)
+        run_tmux("switch-client", "-t", sess)
+        run_tmux("select-window", "-t", sess_win)
+        run_tmux("select-pane", "-t", pane_id)
+        cmd_wake(target=pane_id, force=True)
+        return 0
+
+
+def main() -> int:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    args = sys.argv[2:]
+
+    if cmd == "sync":
+        if "--suspend-idle" in args:
+            return cmd_suspend_idle()
+        with RegistryLock():
+            sync_registry(force_post_restore=False)
+        return 0
+    if cmd == "wake":
+        target = next((a for a in args if not a.startswith("-")), None)
+        return cmd_wake(target=target, force="--force" in args)
+    if cmd == "suspend-idle":
+        return cmd_suspend_idle()
+    if cmd == "toggle":
+        return cmd_toggle(target=args[0] if args else None)
+    if cmd == "suspend":
+        target = args[0] if args else run_tmux("display-message", "-p", "#{pane_id}")
+        with RegistryLock():
+            reg, panes = sync_registry(force_post_restore=False)
+            p = next((x for x in panes if x["locator"] == target or x["pane_id"] == target), None)
+            if p:
+                suspend_pane_entry(p, reg, manual=True)
+        return 0
+    if cmd in ("adopt", "move"):
+        dest_sess: str | None = None
+        mode = "split" if "--split" in args else "window"
+        use_fzf = "--fzf" in args
+        clean_args: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] in ("-t", "--target") and i + 1 < len(args):
+                dest_sess = args[i + 1]
+                i += 2
+            elif args[i].startswith("-"):
+                i += 1
+            else:
+                clean_args.append(args[i])
+                i += 1
+        target_arg = clean_args[0] if clean_args else None
+        return cmd_adopt(target_arg=target_arg, dest_sess=dest_sess, mode=mode, use_fzf=use_fzf)
+    if cmd == "post-restore":
+        return cmd_post_restore()
+    if cmd in ("tui", "menu"):
+        return cmd_tui()
+    if cmd in ("status", "list"):
+        return cmd_status()
+
+    print(
+        "Usage: dot-agent-persist [sync [--suspend-idle]|wake [pane]|toggle [pane]|suspend [pane]|adopt [pane] [-t session] [--split]|suspend-idle|post-restore|tui|status]",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

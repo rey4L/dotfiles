@@ -4,18 +4,38 @@
 # the saved sessions show up here once the server is up.
 set -u
 
+pkill -x fuzzel && exit 0
+
 # Make sure a server exists so continuum can restore the last save.
 if ! tmux has-session 2>/dev/null; then
   tmux start-server \; run-shell ~/.config/tmux/plugins/tmux-continuum/scripts/continuum_restore.sh 2>/dev/null
-  sleep 1
+  for _ in {1..20}; do
+    tmux has-session 2>/dev/null && break
+    sleep 0.1
+  done
 fi
 
-choice=$(
-  {
-    tmux list-sessions -F '#{session_name}: #{session_windows} windows#{?session_attached, (attached),}' 2>/dev/null
-    echo "+ new session"
-  } | fuzzel --dmenu --prompt='tmux ' --width=50
-) || exit 0
+menu=$(
+  awk -F'\t' '
+    NR == FNR {
+      if (!seen[$1, $2]++) wins[$1] = wins[$1] ? wins[$1] ", " $2 : $2
+      next
+    }
+    {
+      w = ($2 == 1) ? "1 window" : $2 " windows"
+      att = ($3 > 0) ? " (attached)" : ""
+      info = wins[$1] ? " [" wins[$1] "]" : ""
+      print $1 ": " w info att
+    }
+  ' <(tmux list-windows -a -F $'#{session_name}\t#{window_name}' 2>/dev/null) \
+    <(tmux list-sessions -F $'#{session_name}\t#{session_windows}\t#{session_attached}' 2>/dev/null)
+  echo "+ new session"
+)
+
+lines=$(printf '%s\n' "$menu" | wc -l)
+((lines > 12)) && lines=12
+
+choice=$(printf '%s\n' "$menu" | fuzzel --dmenu --prompt='tmux ' --width=60 --lines="$lines") || exit 0
 [[ -z $choice ]] && exit 0
 
 if [[ $choice == "+ new session" ]]; then
@@ -24,4 +44,4 @@ if [[ $choice == "+ new session" ]]; then
   exec setsid ghostty -e tmux new-session -A -s "$name"
 fi
 
-exec setsid ghostty -e tmux attach -t "${choice%%:*}"
+exec setsid ghostty -e tmux new-session -A -s "${choice%%:*}"

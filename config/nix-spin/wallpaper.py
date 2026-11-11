@@ -280,9 +280,9 @@ def run():
         except OSError:  # not under Hyprland: always animate
             visible.update(windows)
         else:
-            count = {ws["id"]: ws["windows"] for ws in wss}
+            count = {ws["name"]: ws["windows"] for ws in wss}
             empty = {(m["x"], m["y"]) for m in mons
-                     if count.get(m["activeWorkspace"]["id"], 0) == 0 and not m["specialWorkspace"].get("name")}
+                     if count.get(m["activeWorkspace"]["name"], 0) == 0 and not m["specialWorkspace"].get("name")}
             visible.update(mon for mon in windows
                            if (mon.get_geometry().x, mon.get_geometry().y) in empty)
         if visible and not timer[0]:

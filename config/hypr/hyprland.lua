@@ -486,6 +486,7 @@ bind("SUPER + ESCAPE", "Lock system", exec("dot-lock"))
 bind("XF86PowerOff", "Lock", exec("dot-lock"), locked)
 bind("SUPER + CTRL + L", "Lock system", exec("dot-lock"))
 bind("SUPER + CTRL + SPACE", "Tmux sessions", exec("dot-tmux-sessions"))
+bind("SUPER + ALT + M", "Adopt terminal into tmux", exec("dot-agent-persist adopt"))
 bind("SUPER + SHIFT + SPACE", "Toggle top bar", exec("pkill -SIGUSR1 waybar"))
 
 -- Notifications

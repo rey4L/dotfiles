@@ -80,6 +80,7 @@
     tree-sitter
     luarocks
     dosfstools
+    efibootmgr
     exfatprogs
     btrfs-progs
     tailscale
@@ -97,6 +98,7 @@
     docker-compose
     docker-buildx
     claude-code
+    antigravity-cli
 
     # --- Apps
     chromium
@@ -104,5 +106,6 @@
     discord
     hubstaff
     qbittorrent
+    prismlauncher
   ];
 }

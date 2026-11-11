@@ -1,4 +1,6 @@
 hosts/*/hardware-configuration.nix.bak
 config/nvim/.luarc.json
 config/btop/*.log
+__pycache__/
+*.pyc
 result

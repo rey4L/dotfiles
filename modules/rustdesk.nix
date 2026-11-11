@@ -17,6 +17,10 @@ in
     after = [ "network-online.target" "systemd-user-sessions.service" "tailscaled.service" ];
     # The daemon shells out to loginctl/ps/sudo etc. to find the session and start its user-side server
     path = [ "/run/wrappers" rustdesk ] ++ (with pkgs; [ coreutils gnugrep gawk procps systemd util-linux ]);
+    # Don't restart on rebuild: it kills the server-spawned --tray, the only process the daemon can still
+    # read DISPLAY from under Hyprland (no XAUTHORITY), so the new server comes up without a display and the
+    # uinput mouse falls back to 1920x1080 (remote cursor misaligned). New versions apply on reboot.
+    restartIfChanged = false;
     serviceConfig = {
       ExecStart = "${rustdesk}/bin/rustdesk --service";
       Restart = "always";

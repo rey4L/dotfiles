@@ -12,7 +12,9 @@ let
     "starship.toml" "mimeapps.list" "xdg-terminals.list"
     "chromium-flags.conf" "brave-flags.conf" "fontconfig/fonts.conf"
   ];
-  binScripts = builtins.attrNames (builtins.readDir ../bin);
+  binScripts = builtins.attrNames (
+    lib.filterAttrs (_: t: t == "regular" || t == "symlink") (builtins.readDir ../bin)
+  );
 in
 {
   imports = [ ./nix-spin.nix ];

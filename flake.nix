@@ -7,13 +7,19 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Secure Boot (signed systemd-boot + UKIs) so Windows anti-cheat games run.
+    lanzaboote = {
+      url = "github:nix-community/lanzaboote/v1.2.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { nixpkgs, home-manager, ... }: {
+  outputs = { nixpkgs, home-manager, lanzaboote, ... }: {
     nixosConfigurations.jojen = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
         ./hosts/jojen/configuration.nix
+        lanzaboote.nixosModules.lanzaboote
         home-manager.nixosModules.home-manager
         ({ pkgs, ... }: {
           home-manager.useGlobalPkgs = true;

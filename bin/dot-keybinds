@@ -1,12 +1,28 @@
 #!/usr/bin/env bash
-# Searchable list of Hyprland keybindings (descriptions from bind() in hyprland.lua). Bound to SUPER+K.
+# Searchable list of Hyprland keybindings (descriptions from bind() in hyprland.lua)
+# plus tmux / dot-agent-persist shortcuts and CLI commands. Bound to SUPER+K.
 pkill -x rofi && exit 0 # pressing SUPER+K again closes it
 
-hyprctl binds -j | jq -r '
-  .[] | select(.has_description and .submap == "")
-  | .description as $desc | .modmask as $mask
-  | ([[64, "SUPER"], [4, "CTRL"], [8, "ALT"], [1, "SHIFT"]]
-     | map(select(($mask / .[0] | floor) % 2 == 1) | .[1])) + [.key]
-  | "\(join(" + "))\t\($desc)"' |
-  awk -F'\t' '{ printf "%-28s %s\n", $1, $2 }' |
+{
+  hyprctl binds -j | jq -r '
+    .[] | select(.has_description and .submap == "")
+    | .description as $desc | .modmask as $mask
+    | ([[64, "SUPER"], [4, "CTRL"], [8, "ALT"], [1, "SHIFT"]]
+       | map(select(($mask / .[0] | floor) % 2 == 1) | .[1])) + [.key]
+    | "\(join(" + "))\t\($desc)"'
+  cat <<'EOF'
+TMUX Prefix + s	Toggle suspend/resume agent in pane
+TMUX Prefix + S	Open interactive agent TUI popup
+TMUX Prefix + m	Move/join current pane into another tmux session
+dot-agent-persist adopt	Adopt focused terminal or [pane] into a tmux session
+dot-agent-persist status	List tracked agent panes & states
+dot-agent-persist tui	Interactive fzf picker for agents
+dot-agent-persist toggle	Toggle suspend/resume on [pane]
+dot-agent-persist suspend	Manually suspend agent in [pane]
+dot-agent-persist wake	Resume suspended agent in [pane]
+dot-agent-persist suspend-idle	Suspend idle background agents
+dot-agent-persist sync	Sync live tmux panes with registry
+EOF
+} |
+  awk -F'\t' '{ printf "%-30s %s\n", $1, $2 }' |
   rofi -dmenu -i -p "" -no-custom -theme ~/.config/rofi/keybinds.rasi >/dev/null
