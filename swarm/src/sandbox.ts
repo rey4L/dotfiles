@@ -55,6 +55,8 @@ export function runSandboxed(root: string, command: string, signal?: AbortSignal
     execFile('bwrap', bwrapArgs(root, command), { timeout: TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 10 * 1024 * 1024, signal },
       (err, stdout, stderr) => {
         const code = err ? ((err as { code?: number | string }).code ?? 'error') : 0;
+        // spawn ENOENT = bwrap itself is missing; say so instead of letting the model blame "the shell" (2026-11-22 run).
+        if (code === 'ENOENT') return done('exit=ENOENT\nsandbox unavailable: `bwrap` (bubblewrap) is not on the swarm process PATH. Nothing ran. Tell the user; do not retry.');
         const timedOut = err && (err as { killed?: boolean }).killed ? ` (killed after ${TIMEOUT_MS / 1000}s)` : '';
         done(`exit=${code}${timedOut}\n${(stdout + stderr).slice(-MAX_OUTPUT)}`);
       });

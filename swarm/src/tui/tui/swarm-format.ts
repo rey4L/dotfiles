@@ -2,6 +2,7 @@
 // compact tool rows and dispatch cards. Every string coming from a model goes through sanitizeTerminalText
 // before any TUI-owned ANSI is added.
 import { sanitizeTerminalText } from './sanitize-terminal-text.ts';
+import type { Worker } from '../../route.ts';
 
 export const c = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m', italic: '\x1b[3m', inverse: '\x1b[7m', fg: '\x1b[39m',
@@ -9,12 +10,14 @@ export const c = {
   magenta: '\x1b[95m', cyan: '\x1b[96m', grey: '\x1b[90m', orange: '\x1b[38;5;209m', teal: '\x1b[38;5;43m',
 };
 
-export type AgentKey = 'user' | 'orch' | 'beam' | 'flint';
+export type AgentKey = 'user' | 'orch' | Worker;
 export const AGENTS: Record<AgentKey, { name: string; role: string; model?: string; color: string }> = {
   user: { name: 'You', role: 'User', color: c.cyan },
   orch: { name: 'Ampersand', role: 'Orchestrator', model: 'ampersand-v0.1', color: c.magenta },
   beam: { name: 'Beam', role: 'Heavy Coder', model: 'beam-free', color: c.orange },
   flint: { name: 'Flint', role: 'Fast Coder', model: 'flint-v1.0', color: c.teal },
+  deepseek: { name: 'DeepSeek', role: 'Paid Heavy Coder', model: 'deepseek-v4.1-flash', color: c.blue },
+  haiku: { name: 'Haiku', role: 'Paid Fast Coder', model: 'claude-haiku-5.5', color: c.amber },
 };
 export const badge = (k: AgentKey) => `${AGENTS[k].name} · ${AGENTS[k].role}`;
 
@@ -103,7 +106,7 @@ export function compactRow(o: { tool: string; arg: string; ms?: number; state: T
 }
 
 export type DispatchInput = { id?: string; kind?: string; goal?: string; files?: string[]; estTokens?: number; prefer?: string };
-export type DispatchProgress = { worker?: 'beam' | 'flint'; reason?: string; attempt?: number; log?: string[]; done?: boolean; summary?: string };
+export type DispatchProgress = { worker?: Worker; reason?: string; attempt?: number; log?: string[]; done?: boolean; summary?: string };
 
 // Rich dispatch card. Returns header (1 line) and body lines.
 export function dispatchCard(o: {

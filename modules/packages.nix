@@ -73,6 +73,7 @@
     curl
     wget
     socat
+    bubblewrap # dot-swarm run_command/verify sandbox (swarm/src/sandbox.ts)
     inetutils
     whois
     inxi

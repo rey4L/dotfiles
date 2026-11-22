@@ -5,14 +5,14 @@ import { z } from 'zod';
 import { readFile, writeFile, readdir, mkdir, stat } from 'node:fs/promises';
 import { resolve, relative, dirname, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { route, Leases, MODELS, type Task, type Worker } from './route.ts';
+import { route, Leases, MODELS, FREE_WORKERS, VISION_WORKERS, type Task, type Worker } from './route.ts';
 import { runSandboxed } from './sandbox.ts';
 import type { Journal } from './journal.ts';
 import type { AgentId, Emit, Gate } from './events.ts';
 
 export const ORCHESTRATOR_MODEL = 'humansand/ampersand-v0.1';
 export const ORCHESTRATOR_CONTEXT = 1_000_000;
-export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, flint: 262_144 };
+export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, flint: 262_144, deepseek: 1_048_576, haiku: 1_000_000 };
 const MAX_DISPATCHES = 12; // per batch (a run without a plan is one batch)
 const MAX_BATCHES = 8;
 const ORCH_STEPS_PER_BATCH = 25; // orchestrator turns are slow (p50 ~8s); keep each batch's loop short
@@ -22,7 +22,21 @@ const SNAPSHOT_MAX = 200_000; // edit snapshots above this size carry hashes onl
 const WORKER_INSTRUCTIONS: Record<Worker, string> = {
   beam: 'You are the long-horizon engineer. Explore broadly, reason about architecture, then make coherent multi-file changes.',
   flint: 'You are the fast, scoped engineer. Make the smallest correct change to the leased files. Do not explore beyond what the task needs.',
+  deepseek: 'You are the long-horizon engineer with vision. Explore broadly, reason about architecture, then make coherent multi-file changes.',
+  haiku: 'You are the scoped engineer with vision. Make the smallest correct change to the leased files.',
 };
+const VISION_HOWTO =
+  'You can see images: view_image shows you a PNG/JPEG/WebP/GIF from the workspace. To look at a page, screenshot it with run_command, e.g. ' +
+  '`mkdir -p .shots && chromium --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=1400,900 --virtual-time-budget=5000 --screenshot=.shots/home.png <file:///abs/path.html or http://127.0.0.1:PORT/>` ' +
+  '(start a dev/preview server in the SAME command, in the background, if you need one; there is no network), then view_image .shots/home.png. ' +
+  'Check your UI changes visually before reporting ok. For diagrams, write SVG (or an HTML page with inline SVG), screenshot it and check labels do not overlap or clip. Delete .shots/ when done.';
+// Last step before a step cap: no tools, so the loop ends with a report instead of silence (run 2026-11-22T17-52: orchestrator
+// spent its 50 steps on read_file/status and the TUI showed "Done" with nothing; workers ended as "NO FINAL REPORT").
+const finalStep = (messages: ModelMessage[], what: string) => ({
+  toolChoice: 'none' as const,
+  messages: [...messages, { role: 'user' as const, content: `Step budget used up: no more tool calls. Write your final report now: ${what}` }],
+});
+const STEP_CAP: Record<Worker, number> = { beam: 40, flint: 25, deepseek: 40, haiku: 25 }; // loop guard; Flint was 15 and ran out on most feature tasks (2026-11-22)
 
 type Progress = { worker?: Worker; reason?: string; attempt?: number; log: string[]; done: boolean; summary?: string };
 type DispatchInput = Omit<Task, 'attempt' | 'force'>;
@@ -46,8 +60,8 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
   const ROOT = resolve(rootDir);
   const leases = new Leases();
   const ledger = new Map<string, { worker: Worker; status: 'ok' | 'failed'; summary: string }>();
-  const seen = new Map<string, number>(); // goal hash -> attempts (loop guard)
-  const prevFiles = new Map<string, string[]>(); // goal hash -> files of the last attempt
+  const seen = new Map<string, number>(); // task id / lease set -> attempts (loop guard); cleared when the task succeeds
+  const prevFiles = new Map<string, string[]>(); // task id -> files of the last attempt
   const tasks = new Map<string, DispatchInput>(); // for manual re-dispatch
   const running = new Map<string, AbortController>(); // taskId -> per-worker cancel
   let dispatches = 0;
@@ -122,12 +136,14 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
   // One worker run. Shared by the dispatch tool and manual re-dispatch from a UI.
   async function runWorker(input: DispatchInput, signal: AbortSignal | undefined, onProgress: (p: Progress) => void, force?: Worker): Promise<string> {
     const p: Progress = { log: [], done: false };
-    const key = createHash('sha256').update(input.kind + input.goal).digest('hex');
-    const attempt = (seen.get(key) ?? 0) + 1;
-    seen.set(key, attempt);
+    // Attempts are counted per task id AND per lease set, not per goal text: Ampersand rewords retries, which used to reset
+    // the count and hand a failed task back to Flint as "attempt 1" (run 2026-11-22T18-03: relay-sessions, twice).
+    const idKey = `id:${input.id}`;
     // Escalations sometimes arrive with files=[] (run 3: Beam got no writable files); reuse the previous attempt's lease set.
-    if (attempt > 1 && input.files.length === 0) input = { ...input, files: prevFiles.get(key) ?? [] };
-    prevFiles.set(key, input.files);
+    if (seen.has(idKey) && input.files.length === 0) input = { ...input, files: prevFiles.get(idKey) ?? [] };
+    prevFiles.set(idKey, input.files);
+    const keys = [idKey, ...(input.files.length ? [`files:${[...input.files].sort().join('|')}`] : [])];
+    const attempt = Math.max(...keys.map((k) => seen.get(k) ?? 0)) + 1;
     let files: string[];
     try {
       files = input.files.map((f) => relative(ROOT, safe(f)));
@@ -139,6 +155,7 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
       emit({ type: 'lease.conflict', taskId: input.id, files: clash, heldBy: [...new Set(clash.map((f) => leases.ownerOf(f) ?? '?'))] });
       return `CONFLICT: ${clash.join(', ')} leased by another task. Sequence these tasks.`;
     }
+    keys.forEach((k) => seen.set(k, attempt)); // only runs that actually start count: a rejected dispatch is not an attempt
     tasks.set(input.id, input);
     const agent: AgentId = `task:${input.id}`;
     const mine = new AbortController();
@@ -175,17 +192,17 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
       const agentLoop = new ToolLoopAgent({
         model: model(worker),
         instructions: `${WORKER_INSTRUCTIONS[worker]}
-You may only write: ${files.join(', ') || '(nothing — read-only task)'}.
+${attempt > 1 ? 'Earlier attempts at this task failed: inspect the current workspace state before changing anything.\n' : ''}${VISION_WORKERS.includes(worker) ? VISION_HOWTO + '\n' : ''}You may only write: ${files.join(', ') || '(nothing — read-only task)'}.
 If you changed code and tests exist or you wrote them, run them with run_command and report the result; never claim tests pass without running them.
 End with: STATUS: ok|failed, then a summary under 200 words (files changed, tests run + result, open risks).`,
-        tools: { ...fsTools(input.id, agent), run_command: instrument({ run_command: runCommandTool(agent) }, agent, emit).run_command },
-        stopWhen: isStepCount(worker === 'beam' ? 40 : 15), // loop guard inside each worker
+        tools: { ...fsTools(input.id, agent), ...(VISION_WORKERS.includes(worker) ? instrument({ view_image: viewImageTool(ROOT) }, agent, emit) : {}), run_command: instrument({ run_command: runCommandTool(agent) }, agent, emit).run_command },
+        stopWhen: isStepCount(STEP_CAP[worker]),
         maxRetries: 3, // beam-free is per-model rate-limited on the free tier
         // no stripReasoning here: Beam rejects requests without its earlier reasoning_content (run 2, 2026-11-21)
-        prepareStep: async () => {
+        prepareStep: async ({ stepNumber, messages }) => {
           if (gate) await gate.checkpoint(agent, sig);
           emit({ type: 'agent.status', agent, status: 'thinking' });
-          return {};
+          return stepNumber >= STEP_CAP[worker] - 1 ? finalStep(messages, 'STATUS: ok|failed (failed if the task is not finished), what you changed, what is left, tests run + result.') : {};
         },
         onStepEnd: (step) => {
           kick();
@@ -221,11 +238,14 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       const text = await run;
       const status: 'ok' | 'failed' = /STATUS:\s*ok/i.test(text) ? 'ok' : 'failed';
       // An empty final text (usually the step limit) used to surface as a blank `failed` and trigger a blind escalation.
+      // Long reports are cut to their tail, which dropped the STATUS line: the TUI then showed ok tasks as "failed" and the
+      // orchestrator lost the verdict (run 2026-11-22T18-03, relay-runner on Haiku). Always lead with the parsed status.
       const summary = text.trim()
-        ? text.slice(-1500)
+        ? (text.length <= 1500 ? text : `STATUS: ${status} (report cut to its last 1500 chars)\n…${text.slice(-1500)}`)
         : `NO FINAL REPORT: the worker stopped after ${p.log.length} tool calls without a summary (likely the step limit). ` +
           `Inspect the workspace before retrying. Last actions:\n${p.log.slice(-6).join('\n')}`;
       ledger.set(input.id, { worker, status, summary });
+      if (status === 'ok') keys.forEach((k) => seen.delete(k)); // later, different work on the same files starts fresh
       log({ type: 'result', id: input.id, status, summary });
       emit({ type: 'task.result', taskId: input.id, worker, status, summary });
       emit({ type: 'agent.status', agent, status: status === 'ok' ? 'done' : 'error' });
@@ -248,7 +268,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
 
   const dispatch = tool({
     description:
-      'Delegate one coding task. The router picks Beam (long-horizon/large context) or Flint (fast, scoped). ' +
+      'Delegate one coding task. The router picks Beam (long-horizon/large context) or Flint (fast, scoped); a third attempt goes to a paid model. Set visual=true for web/UI work the worker must look at (vision models: Haiku scoped, DeepSeek large). ' +
       'Declare every file the worker must write; tasks with overlapping files are rejected until the other finishes.',
     inputSchema: z.object({
       id: z.string(),
@@ -256,7 +276,8 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       goal: z.string(),
       files: z.array(z.string()).default([]),
       estTokens: z.number().int().nonnegative(),
-      prefer: z.enum(['beam', 'flint']).optional(),
+      prefer: z.enum(FREE_WORKERS).optional(),
+      visual: z.boolean().optional().describe('true when the worker must LOOK at something: web/UI work, screenshots, design mockups, images, diagrams (architecture/flow/sequence). Routes to a vision model that can screenshot pages and view images.'),
     }),
     // Generator: each yield updates the TUI tool card; toModelOutput sends only the summary to the orchestrator.
     execute: async function* (input, { abortSignal }): AsyncGenerator<Progress> {
@@ -303,17 +324,19 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       `Split a request that needs more than ~10 dispatches into batches, BEFORE dispatching anything. Up to ${MAX_BATCHES} batches of up to 10 tasks, ` +
       'in dependency order. verify: a command that must pass before the next batch starts (e.g. "npm test"). Each batch gets a fresh dispatch budget.',
     inputSchema: z.object({
-      batches: z.array(z.object({ id: z.string(), goal: z.string(), tasks: z.array(z.string()).min(1).max(10) })).min(1).max(MAX_BATCHES),
+      batches: z.array(z.object({ id: z.string(), goal: z.string(), tasks: z.array(z.union([z.string(), z.object({ id: z.string().optional(), goal: z.string().optional() }).passthrough()])).min(1).max(10) })).min(1).max(MAX_BATCHES),
       verify: z.string().optional(),
     }),
     execute: async (input) => {
       if (plan && batchIdx < plan.batches.length && !halted) return `REFUSED: a plan is in progress (batch ${batchIdx + 1}/${plan.batches.length}). Finish it.`;
-      plan = input;
+      // Ampersand sometimes sends tasks as {id, goal} objects (run 2026-11-22T18-03: first plan call failed validation).
+      const name = (t: string | { id?: string; goal?: string }) => (typeof t === 'string' ? t : [t.id, t.goal].filter(Boolean).join(': ') || JSON.stringify(t));
+      plan = { ...input, batches: input.batches.map((b) => ({ ...b, tasks: b.tasks.map(name) })) };
       batchIdx = verifyFails = dispatches = 0;
       halted = false;
       batchLog.length = 0;
       batchEvent('start');
-      return `Plan saved. Batch 1/${input.batches.length} (${input.batches[0].id}): ${input.batches[0].goal}\nTasks: ${input.batches[0].tasks.join('; ')}\nCall batch_done when its tasks are done.`;
+      return `Plan saved. Batch 1/${plan.batches.length} (${plan.batches[0].id}): ${plan.batches[0].goal}\nTasks: ${plan.batches[0].tasks.join('; ')}\nCall batch_done when its tasks are done.`;
     },
   });
   const batch_done = tool({
@@ -386,6 +409,8 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       }
       if (gate) await gate.checkpoint('orch');
       emit({ type: 'agent.status', agent: 'orch', status: 'thinking' });
+      if (stepNumber >= ORCH_STEPS_PER_BATCH * (1 + batchIdx - turnBatchBase) - 1)
+        return finalStep(stripReasoning(messages), 'what was done (with batch progress), what is NOT done, risks, and exactly what the user should say to continue.');
       return { messages: stripReasoning(messages) };
     },
     onStepEnd: (step) => {
@@ -450,6 +475,28 @@ export const makeSafe = (ROOT: string) => (p: string) => {
   return abs;
 };
 
+const IMAGE_TYPES: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+const IMAGE_MAX = 5 * 1024 * 1024;
+
+// Vision workers only: Beam/Flint are text-only and would reject image content.
+export function viewImageTool(ROOT: string) {
+  const safe = makeSafe(ROOT);
+  return tool({
+    description: 'Look at an image file (png/jpg/webp/gif, max 5 MB) relative to the workspace root, e.g. a screenshot you just took.',
+    inputSchema: z.object({ path: z.string() }),
+    execute: async ({ path }): Promise<{ error: string } | { path: string; mediaType: string; data: string }> => {
+      const type = IMAGE_TYPES[path.split('.').pop()?.toLowerCase() ?? ''];
+      if (!type) return { error: `not an image type I can show: ${path}` };
+      const buf = await readFile(safe(path));
+      if (buf.length > IMAGE_MAX) return { error: `${path} is ${buf.length} bytes; max ${IMAGE_MAX}. Take a smaller screenshot.` };
+      return { path, mediaType: type, data: buf.toString('base64') };
+    },
+    toModelOutput: ({ output }) => 'error' in output
+      ? { type: 'text' as const, value: output.error }
+      : { type: 'content' as const, value: [{ type: 'text' as const, text: `image ${output.path}` }, { type: 'file' as const, mediaType: output.mediaType, data: { type: 'data' as const, data: output.data } }] },
+  });
+}
+
 type FsHooks = { emit?: Emit; gate?: Gate; agent?: AgentId };
 
 export function makeFsTools(ROOT: string, leases: Leases, taskId: string, h: FsHooks = {}) {
@@ -476,7 +523,10 @@ export function makeFsTools(ROOT: string, leases: Leases, taskId: string, h: FsH
         if (lastRead.get(abs) === mtime) return `(unchanged since you last read ${path} in this task; use your earlier copy)`;
         lastRead.set(abs, mtime);
         emit({ type: 'file.read', agent, path: relative(ROOT, abs) });
-        return (await readFile(abs, 'utf8')).slice(0, 200_000);
+        // The orchestrator reads specs only; a 4.7k-line debug log in its context preceded "request exceeded its processing deadline" (run 2026-11-22T18-03).
+        const max = agent === 'orch' ? 40_000 : 200_000;
+        const text = await readFile(abs, 'utf8');
+        return text.length <= max ? text : `${text.slice(0, max)}\n… [truncated: ${path} is ${text.length} chars, showing the first ${max}${agent === 'orch' ? '; dispatch a worker to dig into large files' : ''}]`;
       },
     }),
     // Whole-file writes only create files: a worker rewriting a 1.5k-line script truncated it (run 1, 2026-11-21).

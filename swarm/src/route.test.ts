@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { route, Leases, type Task } from './route.ts';
-import { stripReasoning } from './swarm.ts';
+import { stripReasoning, viewImageTool } from './swarm.ts';
 
 test('stripReasoning drops assistant reasoning only', () => {
   const out = stripReasoning([
@@ -20,6 +20,22 @@ test('big context goes to beam even if flint preferred', () =>
 test('long-horizon kinds go to beam', () => assert.equal(route({ ...base, kind: 'terminal' }).worker, 'beam'));
 test('wide change goes to beam', () => assert.equal(route({ ...base, files: ['1', '2', '3', '4', '5', '6'] }).worker, 'beam'));
 test('second attempt escalates', () => assert.equal(route({ ...base, attempt: 2 }).worker, 'beam'));
+test('final attempt on a scoped task goes to haiku', () => assert.equal(route({ ...base, attempt: 3 }).worker, 'haiku'));
+test('final attempt on a big task goes to deepseek', () => {
+  assert.equal(route({ ...base, attempt: 3, estTokens: 400_000 }).worker, 'deepseek');
+  assert.equal(route({ ...base, attempt: 3, kind: 'refactor' }).worker, 'deepseek');
+});
+test('visual tasks go to vision models by size, swapping on the final attempt', () => {
+  assert.equal(route({ ...base, visual: true }).worker, 'haiku');
+  assert.equal(route({ ...base, visual: true, attempt: 2 }).worker, 'haiku');
+  assert.equal(route({ ...base, visual: true, attempt: 3 }).worker, 'deepseek');
+  assert.equal(route({ ...base, visual: true, kind: 'refactor' }).worker, 'deepseek');
+  assert.equal(route({ ...base, visual: true, kind: 'refactor', attempt: 3 }).worker, 'haiku');
+});
+test('paid models only via the final attempt or force', () => {
+  for (const a of [1, 2]) assert.ok(['beam', 'flint'].includes(route({ ...base, attempt: a, kind: 'explore' }).worker));
+  assert.equal(route({ ...base, force: 'deepseek' }).worker, 'deepseek');
+});
 test('attempt budget enforced', () => assert.throws(() => route({ ...base, attempt: 4 })));
 
 test('leases reject overlap and release cleanly', () => {
@@ -101,4 +117,18 @@ test('sandbox: file: deps are mounted read-only with .env masked', async () => {
   assert.match(out, /export type T = 1;/);
   assert.doesNotMatch(out, /SECRET=abc/);
   assert.match(out, /Read-only file system/);
+});
+
+test('view_image returns the image as a file part, rejects non-images', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewimg-'));
+  writeFileSync(join(dir, 'a.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  writeFileSync(join(dir, 'a.txt'), 'x');
+  const t = viewImageTool(dir);
+  const ok = await t.execute!({ path: 'a.png' }, { toolCallId: '1', messages: [] } as never);
+  const out = await t.toModelOutput!({ toolCallId: '1', input: { path: 'a.png' }, output: ok } as never) as { type: string; value: { type: string; mediaType?: string }[] };
+  assert.equal(out.type, 'content');
+  assert.equal(out.value[1].type, 'file');
+  assert.equal(out.value[1].mediaType, 'image/png');
+  const bad = await t.execute!({ path: 'a.txt' }, { toolCallId: '2', messages: [] } as never);
+  assert.ok('error' in (bad as object));
 });

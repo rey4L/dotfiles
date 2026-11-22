@@ -21,6 +21,7 @@ import {
 } from './swarm-format.ts';
 import { filterCommands, MODE_HELP, type Command, type Mode } from './commands.ts';
 import type { SwarmEvent } from '../../events.ts';
+import type { Worker } from '../../route.ts';
 import {
   getToolName,
   isToolUIPart,
@@ -130,7 +131,7 @@ type ChatSection = {
   cache?: { key: string; lines: string[] };
 };
 
-type WorkerView = { taskId: string; worker: 'beam' | 'flint'; status: string; detail?: string; since: number; attempt: number; endedAt?: number };
+type WorkerView = { taskId: string; worker: Worker; status: string; detail?: string; since: number; attempt: number; endedAt?: number };
 
 const TICK_MS = 100;
 const STALL_MS = 15_000;
@@ -189,7 +190,8 @@ export class TerminalRenderer {
   // inline mode (default): finished sections are printed once into the terminal's own scrollback; only the live
   // region (unfinished sections + footer) is redrawn. Ctrl+O switches to the full-screen transcript (alt screen).
   #transcript = false;
-  #committed = 0;
+  #committed = 0; // every section before this index is in scrollback
+  #done = new Set<number>(); // sections at/after #committed already in scrollback (finished while an earlier one runs)
   #dynHeight = 0;
   #lastDyn = '';
   #history: string[] = [];
@@ -220,6 +222,7 @@ export class TerminalRenderer {
     this.#expanded.clear();
     this.#outcome = undefined;
     this.#committed = 0;
+    this.#done.clear();
     this.#dynHeight = 0;
     this.#lastDyn = '';
     if (!this.#transcript && this.#isInteractive) this.#output.write('\x1b[2J\x1b[3J\x1b[H');
@@ -891,27 +894,31 @@ export class TerminalRenderer {
   #paintInline(final: boolean) {
     const width = this.#width();
     const inner = Math.max(20, width - 1);
-    // 1. Commit the finished prefix.
+    // 1. Commit every finished section, in completion order: a long-running dispatch must not hold everything after it
+    // in the live region (it grew past the screen, was clipped and redrawn every tick: "vibrating", nothing to scroll).
+    // The Ctrl+O transcript keeps the true order.
     const committed: string[] = [];
-    let i = this.#committed;
-    while (i < this.#sections.length && (final || this.#isFinal(i))) {
-      const s = this.#sections[i];
+    const ready = (k: number) => !this.#done.has(k) && (final || this.#isFinal(k));
+    for (let k = this.#committed; k < this.#sections.length; k++) {
+      if (!ready(k)) continue;
+      const s = this.#sections[k];
       if (s.kind === 'tool' && s.tool && isExploreTool(s.tool.name)) {
-        let j = i;
-        while (j < this.#sections.length && this.#sections[j].kind === 'tool' && this.#sections[j].tool && isExploreTool(this.#sections[j].tool!.name) && (final || this.#isFinal(j))) j++;
-        committed.push(...this.#exploreLines(this.#sections.slice(i, j), inner));
-        i = j;
+        let j = k;
+        while (j < this.#sections.length && this.#sections[j].kind === 'tool' && this.#sections[j].tool && isExploreTool(this.#sections[j].tool!.name) && ready(j)) j++;
+        committed.push(...this.#exploreLines(this.#sections.slice(k, j), inner));
+        for (let m = k; m < j; m++) this.#done.add(m);
+        k = j - 1;
         continue;
       }
       committed.push(...this.#inlineLines(s, inner, false));
-      i++;
+      this.#done.add(k);
     }
-    this.#committed = i;
+    while (this.#done.has(this.#committed)) this.#done.delete(this.#committed++);
 
     // 2. The live region: unfinished sections, then the footer.
     let live: string[] = [];
     if (!final) {
-      for (let k = i; k < this.#sections.length; k++) live.push(...this.#inlineLines(this.#sections[k], inner, true));
+      for (let k = this.#committed; k < this.#sections.length; k++) if (!this.#done.has(k)) live.push(...this.#inlineLines(this.#sections[k], inner, true));
       const footer = this.#inlineFooter(inner);
       const room = Math.max(3, this.#height() - footer.length - 1);
       if (live.length > room) live = [`${c.dim}  … ${live.length - room + 1} more lines above (ctrl+o for the transcript)${c.reset}`, ...live.slice(live.length - room + 1)];
@@ -926,7 +933,7 @@ export class TerminalRenderer {
     if (committed.length) out += committed.map((l) => clip(l, inner)).join('\n') + '\n';
     out += dyn;
     if (final && !dyn) out += '';
-    this.#output.write(out);
+    this.#output.write(`\x1b[?2026h${out}\x1b[?2026l`);
     this.#dynHeight = final ? 0 : live.length;
     this.#lastDyn = dyn;
   }
@@ -981,7 +988,7 @@ export class TerminalRenderer {
 
     if (t.name === 'dispatch') {
       const input = (t.input ?? {}) as { id?: string; kind?: string; goal?: string };
-      const p = (t.output && typeof t.output === 'object' ? t.output : {}) as { worker?: 'beam' | 'flint'; reason?: string; attempt?: number; log?: string[]; summary?: string };
+      const p = (t.output && typeof t.output === 'object' ? t.output : {}) as { worker?: Worker; reason?: string; attempt?: number; log?: string[]; summary?: string };
       const w = p.worker ? AGENTS[p.worker] : undefined;
       const who = w ? ` ${c.dim}→${c.reset} ${w.color}${w.name}${c.reset} ${c.dim}(${w.model})${c.reset}` : '';
       const attempt = p.attempt && p.attempt > 1 ? ` ${c.amber}attempt ${p.attempt}${c.reset}` : '';
@@ -1106,7 +1113,8 @@ export class TerminalRenderer {
 
   #workerLines(width: number): string[] {
     const now = Date.now();
-    return (['beam', 'flint'] as const).map((k) => {
+    const used = new Set([...this.#workers.values()].map((w) => w.worker));
+    return (['beam', 'flint', 'deepseek', 'haiku'] as const).filter((k) => k === 'beam' || k === 'flint' || used.has(k)).map((k) => {
       const a = AGENTS[k];
       const mine = [...this.#workers.values()].filter((w) => w.worker === k);
       const active = mine.filter((w) => w.endedAt == null);
