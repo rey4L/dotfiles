@@ -13,7 +13,9 @@ import type { AgentId, Emit, Gate } from './events.ts';
 export const ORCHESTRATOR_MODEL = 'humansand/ampersand-v0.1';
 export const ORCHESTRATOR_CONTEXT = 1_000_000;
 export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, flint: 262_144 };
-const MAX_DISPATCHES = 12;
+const MAX_DISPATCHES = 12; // per batch (a run without a plan is one batch)
+const MAX_BATCHES = 8;
+const ORCH_STEPS_PER_BATCH = 25; // orchestrator turns are slow (p50 ~8s); keep each batch's loop short
 const WATCHDOG_MS = 15 * 60_000; // a worker with no finished step for this long is aborted as stuck
 const SNAPSHOT_MAX = 200_000; // edit snapshots above this size carry hashes only
 
@@ -49,6 +51,22 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
   const tasks = new Map<string, DispatchInput>(); // for manual re-dispatch
   const running = new Map<string, AbortController>(); // taskId -> per-worker cancel
   let dispatches = 0;
+  // Batch plan: a big request is split into batches; each gets a fresh dispatch budget and a compacted orchestrator context.
+  type Batch = { id: string; goal: string; tasks: string[] };
+  let plan: { batches: Batch[]; verify?: string } | undefined;
+  let batchIdx = 0;
+  let verifyFails = 0;
+  let halted = false; // verify failed twice: no more dispatches until the human steps in
+  let compactPending = false;
+  let compactFrom = -1; // index into this turn's messages; earlier ones are replaced by a handoff
+  let turnBatchBase = 0;
+  const batchLog: string[] = [];
+  const batchEvent = (status: 'start' | 'done' | 'failed', summary?: string) => {
+    const b = plan!.batches[batchIdx];
+    const e = { type: 'batch' as const, id: b.id, index: batchIdx, total: plan!.batches.length, goal: b.goal, status, summary };
+    log(e);
+    emit(e);
+  };
   let beamBusy: Promise<void> = Promise.resolve(); // beam-free is rate-limited: one Beam worker at a time (only with a UI)
 
   // Models: plain gateway ids for the TUI (unchanged); wrapped to report rate limits when a UI listens.
@@ -88,17 +106,18 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
       'Run a shell command in the workspace inside a sandbox (no network, host read-only, only the workspace writable, 180s limit). ' +
       'Use it to run tests/linters. Returns exit code and the tail of the output.',
     inputSchema: z.object({ command: z.string() }),
-    execute: async ({ command }, { abortSignal }) => {
-      if (gate) {
-        emit({ type: 'agent.status', agent, status: 'awaiting_approval', detail: command.slice(0, 120) });
-        const d = await gate.beforeTool(agent, 'run_command', { command }, 'shell command', abortSignal);
-        emit({ type: 'agent.status', agent, status: 'tool', detail: 'run_command' });
-        if (!d.approve) return 'DENIED by the human reviewer. Do not retry this command; report it.';
-        command = (d.input as { command?: string } | undefined)?.command ?? command;
-      }
-      return runSandboxed(ROOT, command, abortSignal);
-    },
+    execute: async ({ command }, { abortSignal }) => runCommand(agent, command, abortSignal),
   });
+  async function runCommand(agent: AgentId, command: string, abortSignal?: AbortSignal): Promise<string> {
+    if (gate) {
+      emit({ type: 'agent.status', agent, status: 'awaiting_approval', detail: command.slice(0, 120) });
+      const d = await gate.beforeTool(agent, 'run_command', { command }, 'shell command', abortSignal);
+      emit({ type: 'agent.status', agent, status: 'tool', detail: 'run_command' });
+      if (!d.approve) return 'DENIED by the human reviewer. Do not retry this command; report it.';
+      command = (d.input as { command?: string } | undefined)?.command ?? command;
+    }
+    return runSandboxed(ROOT, command, abortSignal);
+  }
 
   // One worker run. Shared by the dispatch tool and manual re-dispatch from a UI.
   async function runWorker(input: DispatchInput, signal: AbortSignal | undefined, onProgress: (p: Progress) => void, force?: Worker): Promise<string> {
@@ -242,7 +261,12 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
     // Generator: each yield updates the TUI tool card; toModelOutput sends only the summary to the orchestrator.
     execute: async function* (input, { abortSignal }): AsyncGenerator<Progress> {
       const finish = (p: Progress, summary: string) => ({ ...p, done: true, summary });
-      if (++dispatches > MAX_DISPATCHES) return yield finish({ log: [], done: false }, 'REFUSED: dispatch budget exhausted. Report to the user.');
+      if (halted) return yield finish({ log: [], done: false }, 'REFUSED: the batch plan is halted (verify failed twice). Report to the user.');
+      if (++dispatches > MAX_DISPATCHES) {
+        return yield finish({ log: [], done: false }, plan
+          ? 'REFUSED: dispatch budget for this batch exhausted. Call batch_done.'
+          : 'REFUSED: dispatch budget exhausted. Report to the user; for big requests call plan first to split the work into batches.');
+      }
       // Bridge runWorker's callback progress into this generator's yields.
       const queue: Progress[] = [];
       let last: Progress = { log: [], done: false };
@@ -274,6 +298,64 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
     },
   });
 
+  const plan_tool = tool({
+    description:
+      `Split a request that needs more than ~10 dispatches into batches, BEFORE dispatching anything. Up to ${MAX_BATCHES} batches of up to 10 tasks, ` +
+      'in dependency order. verify: a command that must pass before the next batch starts (e.g. "npm test"). Each batch gets a fresh dispatch budget.',
+    inputSchema: z.object({
+      batches: z.array(z.object({ id: z.string(), goal: z.string(), tasks: z.array(z.string()).min(1).max(10) })).min(1).max(MAX_BATCHES),
+      verify: z.string().optional(),
+    }),
+    execute: async (input) => {
+      if (plan && batchIdx < plan.batches.length && !halted) return `REFUSED: a plan is in progress (batch ${batchIdx + 1}/${plan.batches.length}). Finish it.`;
+      plan = input;
+      batchIdx = verifyFails = dispatches = 0;
+      halted = false;
+      batchLog.length = 0;
+      batchEvent('start');
+      return `Plan saved. Batch 1/${input.batches.length} (${input.batches[0].id}): ${input.batches[0].goal}\nTasks: ${input.batches[0].tasks.join('; ')}\nCall batch_done when its tasks are done.`;
+    },
+  });
+  const batch_done = tool({
+    description: 'Close the current batch after its tasks are done: runs the plan\'s verify command, then opens the next batch with a fresh dispatch budget.',
+    inputSchema: z.object({ summary: z.string().describe('what this batch delivered: files, tests, open risks (under 120 words)') }),
+    execute: async ({ summary }, { abortSignal }) => {
+      if (!plan || batchIdx >= plan.batches.length) return 'No open batch. Finish with your report.';
+      if (halted) return 'The plan is halted. Report to the user.';
+      const b = plan.batches[batchIdx];
+      if (plan.verify) {
+        const out = await runCommand('orch', plan.verify, abortSignal);
+        if (!out.startsWith('exit=0')) {
+          if (++verifyFails >= 2) {
+            halted = true;
+            batchEvent('failed', out.slice(-400));
+            return `STOP: verify failed twice for batch ${b.id}. Do not dispatch more; report to the user.\n${out}`;
+          }
+          return `VERIFY FAILED for batch ${b.id}; the batch stays open (${Math.max(0, MAX_DISPATCHES - dispatches)} dispatches left). Fix it, then call batch_done again.\n${out}`;
+        }
+      }
+      verifyFails = 0;
+      batchLog.push(`- ${b.id} [done]: ${summary.slice(0, 600)}`);
+      batchEvent('done', summary);
+      if (++batchIdx >= plan.batches.length) return 'All batches done. Finish with your final report.';
+      dispatches = 0;
+      compactPending = true;
+      batchEvent('start');
+      const nb = plan.batches[batchIdx];
+      return `Batch ${b.id} closed. Batch ${batchIdx + 1}/${plan.batches.length} (${nb.id}): ${nb.goal}\nTasks: ${nb.tasks.join('; ')}`;
+    },
+  });
+  // Replaces the finished batches' turns with a short handoff, so later batches start with a small context.
+  const handoff = (request: string) => {
+    const nb = plan!.batches[batchIdx];
+    const done = `${request}\n\n[BATCH HANDOFF] Batches done so far:\n${batchLog.join('\n')}\n\n`;
+    if (!nb) return `${done}All batches are done. Finish with your final report.`;
+    return done +
+      `Current batch ${batchIdx + 1}/${plan!.batches.length} (${nb.id}): ${nb.goal}\nTasks: ${nb.tasks.join('; ')}\n` +
+      `Remaining after it: ${plan!.batches.slice(batchIdx + 1).map((x) => x.id).join(', ') || '(none)'}. Dispatch this batch's tasks, then call batch_done.`;
+  };
+  const msgText = (m: ModelMessage) => (typeof m.content === 'string' ? m.content : m.content.map((c) => ('text' in c ? c.text : '')).join(''));
+
   const { list_files, read_file } = fsTools('orchestrator', 'orch'); // read-only: no lease, so write_file is omitted
   const agent = new ToolLoopAgent({
     model: model('orch'),
@@ -283,17 +365,24 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
 - Track the shared goal. If two worker reports contradict each other, do not pick silently: dispatch a Beam "architecture" task to reconcile, or ask the user.
 - A failed task may be retried once with the SAME goal text (the router escalates it). Never retry more than that.
 - Workers can run tests in a sandbox; ask for that in goals that change code.
+- If the request needs more than ~10 dispatches, call plan FIRST to split it into batches; work one batch at a time and call batch_done after each. Never try to fit a big request into one batch.
 - Pass when there is nothing useful to add. Finish with a short report: done, not done, risks.${
       opts.resumeContext ? `\n\nYou are RESUMING an earlier run. Restored state from its journal:\n${opts.resumeContext}` : ''}`,
-    tools: { dispatch, status, list_files, read_file, ...(opts.askUser ? { ask_user } : {}) },
-    stopWhen: isStepCount(25), // orchestrator turns are slow (p50 ~8s); keep the loop short
+    tools: { dispatch, status, plan: plan_tool, batch_done, list_files, read_file, ...(opts.askUser ? { ask_user } : {}) },
+    stopWhen: ({ steps }) => steps.length >= ORCH_STEPS_PER_BATCH * (1 + batchIdx - turnBatchBase),
     // Ampersand returns encrypted reasoning; once the TUI rebuilds history from UI messages the gateway
     // rejects it ("Encrypted reasoning is invalid or incompatible", 400). Prior reasoning isn't needed, so drop it.
     prepareStep: async ({ messages, stepNumber }) => {
       const last = messages.at(-1);
-      if (stepNumber === 0 && last?.role === 'user') {
-        const text = typeof last.content === 'string' ? last.content : last.content.map((c) => ('text' in c ? c.text : '')).join('');
-        log({ type: 'user', text });
+      if (stepNumber === 0) {
+        compactFrom = -1;
+        turnBatchBase = Math.min(batchIdx, plan?.batches.length ?? 0);
+        if (last?.role === 'user') log({ type: 'user', text: msgText(last) });
+      }
+      if (compactPending) { compactFrom = messages.length; compactPending = false; }
+      if (compactFrom >= 0 && plan) {
+        const request = [...messages.slice(0, compactFrom)].reverse().find((m) => m.role === 'user');
+        messages = [{ role: 'user', content: handoff(request ? msgText(request) : '') }, ...messages.slice(compactFrom)];
       }
       if (gate) await gate.checkpoint('orch');
       emit({ type: 'agent.status', agent: 'orch', status: 'thinking' });

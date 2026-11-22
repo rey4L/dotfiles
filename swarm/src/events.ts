@@ -18,6 +18,7 @@ export type SwarmEvent =
       beforeHash: string | null; afterHash: string; before?: string; after?: string }
   | { type: 'task.result'; taskId: string; worker: 'beam' | 'flint'; status: 'ok' | 'failed' | 'stuck' | 'cancelled'; summary: string }
   | { type: 'human.input'; question: string }
+  | { type: 'batch'; id: string; index: number; total: number; goal: string; status: 'start' | 'done' | 'failed'; summary?: string }
   | { type: 'ratelimit'; model: string; message: string }
   | { type: 'error'; agent?: AgentId; message: string };
 

@@ -1310,6 +1310,8 @@ def format_swarm_event(e: dict[str, Any]) -> str:
         return f"{t}   {e.get('id')}: {e.get('line')}"
     if k == "result":
         return f"{t} DONE  {e.get('id')} [{e.get('status')}] {(e.get('summary') or '').strip().replace(chr(10), ' ')[:300]}"
+    if k == "batch":
+        return f"{t} BATCH {e.get('index', 0) + 1}/{e.get('total')} {e.get('id')} [{e.get('status')}] {(e.get('goal') if e.get('status') == 'start' else e.get('summary') or '')[:300]}"
     if k == "error":
         return f"{t} ERROR {e.get('message')}"
     if k == "end":
