@@ -1,0 +1,18 @@
+{
+  "name": "dot-swarm",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test src/*.test.ts",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "@ai-sdk/tui": "^1.0.180",
+    "ai": "^7.0.179",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

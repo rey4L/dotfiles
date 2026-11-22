@@ -7,12 +7,14 @@ Supports: Claude Code (claude), Antigravity CLI (agy), Codex CLI (codex)
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -33,6 +35,8 @@ TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "Alacritty", "kitty", "f
 VALID_CLAUDE_MODES = {"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
 DEFAULT_IDLE_TIMEOUT_MIN = 30
 HOSTNAME = os.uname().nodename
+# ~/.local/bin/<this> is an out-of-store symlink into ~/dotfiles/bin, so resolve() lands in the repo.
+SWARM_DIR = Path(__file__).resolve().parent.parent / "swarm"
 
 FZF_COLORS = (
     "--color=bg:#1e1e2e,fg:#cdd6f4,bg+:#313244,fg+:#89b4fa,"
@@ -1243,8 +1247,198 @@ def cmd_adopt(
     return 0
 
 
+SWARM_JOURNALS = STATE_DIR / "swarm"  # written by swarm/src/journal.ts
+
+
+def swarm_argv(*args: str) -> list[str]:
+    env_file = SWARM_DIR / ".env"
+    env_args = [f"--env-file={env_file}"] if env_file.is_file() else []
+    # absolute node path so systemd timers (minimal PATH) can run it too
+    return [shutil.which("node") or "node", *env_args, str(SWARM_DIR / "src" / "cli.ts"), *args]
+
+
+def read_swarm_journal(path: Path) -> list[dict[str, Any]]:
+    events = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def swarm_run_state(events: list[dict[str, Any]]) -> str:
+    end = next((e for e in reversed(events) if e.get("type") == "end"), None)
+    if end:
+        return end.get("status", "done")
+    pid = next((e.get("pid") for e in events if e.get("type") == "start"), None)
+    try:  # alive only if that pid is still our cli.ts (no signal sent; guards against pid reuse)
+        if pid and "cli.ts" in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="ignore"):
+            return "running"
+    except OSError:
+        pass
+    return "dead"
+
+
+def resolve_swarm_run(ref: str) -> Path | None:
+    runs = sorted(SWARM_JOURNALS.glob("*.jsonl"))
+    if ref in ("", "latest"):
+        return runs[-1] if runs else None
+    hits = [r for r in runs if r.stem.startswith(ref) or r.stem.endswith(ref)]
+    return hits[-1] if hits else None
+
+
+def local_hms(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+    except ValueError:
+        return ""
+
+
+def format_swarm_event(e: dict[str, Any]) -> str:
+    t, k = local_hms(e.get("t", "")), e.get("type")
+    if k == "start":
+        return f"{t} START {e.get('mode')} in {e.get('dir')}" + (f" (resume of {e['resumeOf']})" if e.get("resumeOf") else "")
+    if k == "user":
+        return f"{t} USER  {e.get('text', '')[:300]}"
+    if k == "step":
+        txt = (e.get("text") or "").strip().replace("\n", " ")[:300]
+        return f"{t} ORCH  {txt}" + (f" [{', '.join(e.get('tools', []))}]" if e.get("tools") else "")
+    if k == "dispatch":
+        return f"{t} TASK  {e.get('id')} {e.get('kind')} -> {e.get('worker')} ({e.get('reason')}, attempt {e.get('attempt')}) files={e.get('files')}"
+    if k == "worker":
+        return f"{t}   {e.get('id')}: {e.get('line')}"
+    if k == "result":
+        return f"{t} DONE  {e.get('id')} [{e.get('status')}] {(e.get('summary') or '').strip().replace(chr(10), ' ')[:300]}"
+    if k == "error":
+        return f"{t} ERROR {e.get('message')}"
+    if k == "end":
+        return f"{t} END   {e.get('status')}"
+    return f"{t} {json.dumps(e)}"
+
+
+def cmd_swarm_ps() -> int:
+    runs = sorted(SWARM_JOURNALS.glob("*.jsonl"))
+    if not runs:
+        print("No swarm runs.")
+        return 0
+    home = str(Path.home())
+    print(f"{'RUN':<26} {'STATE':<8} {'MODE':<5} {'TASKS':<6} {'OK/FAIL/STUCK':<14} {'LAST':<9} DIR")
+    for r in runs[-20:]:
+        ev = read_swarm_journal(r)
+        start = next((e for e in ev if e.get("type") == "start"), {})
+        res = {e.get("id"): e.get("status") for e in ev if e.get("type") == "result"}
+        tally = "/".join(str(sum(1 for s in res.values() if s == k)) for k in ("ok", "failed", "stuck"))
+        tasks = len({e.get("id") for e in ev if e.get("type") == "dispatch"})
+        last = local_hms(ev[-1].get("t", "")) if ev else ""
+        print(f"{r.stem:<26} {swarm_run_state(ev):<8} {start.get('mode', '?'):<5} {tasks:<6} {tally:<14} {last:<9} {(start.get('dir') or '').replace(home, '~', 1)}")
+    return 0
+
+
+def cmd_swarm_tail(ref: str, follow: bool) -> int:
+    path = resolve_swarm_run(ref)
+    if not path:
+        print(f"swarm: no run matching {ref!r}", file=sys.stderr)
+        return 1
+    print(f"== {path.stem}")
+    seen = 0
+    while True:
+        ev = read_swarm_journal(path)
+        for e in ev[seen:]:
+            print(format_swarm_event(e), flush=True)
+        seen = len(ev)
+        if not follow or swarm_run_state(ev) != "running":
+            return 0
+        time.sleep(1)
+
+
+def cmd_swarm_schedule(args: list[str]) -> int:
+    if args and args[0] in ("ls", "list"):
+        return subprocess.run(["systemctl", "--user", "list-timers", "--all", "swarm-*"], check=False).returncode
+    if args and args[0] in ("rm", "cancel") and len(args) > 1:
+        unit = args[1].removesuffix(".timer")
+        return subprocess.run(["systemctl", "--user", "stop", f"{unit}.timer"], check=False).returncode
+    if len(args) < 2:
+        print('Usage: dot-agent-persist swarm schedule "<OnCalendar>" "<request>" [dir] | schedule ls | schedule rm <unit>', file=sys.stderr)
+        return 1
+    when, request = args[0], args[1]
+    cwd = os.path.abspath(os.path.expanduser(args[2])) if len(args) > 2 else os.getcwd()
+    if not os.path.isdir(cwd):
+        print(f"swarm: not a directory: {cwd}", file=sys.stderr)
+        return 1
+    unit = f"swarm-{time.strftime('%Y%m%d-%H%M%S')}"
+    # shortcut: transient systemd-run timer, gone after reboot/logout; upgrade to a home-manager systemd.user.timers entry for permanent schedules
+    res = subprocess.run(
+        ["systemd-run", "--user", f"--unit={unit}", f"--on-calendar={when}", f"--working-directory={cwd}",
+         "--", *swarm_argv("run", request, cwd)],
+        check=False,
+    )
+    if res.returncode == 0:
+        print(f"scheduled {unit} ({when}); results: dot-agent-persist swarm ps | tail latest; cancel: swarm schedule rm {unit}")
+    return res.returncode
+
+
+def cmd_swarm(args: list[str], new_window: bool = False) -> int:
+    """swarm [tui] [dir] | run "<req>" [dir] | ps | tail [run] [-f] | resume [run] [dir] | schedule ... ; --host H runs it over ssh."""
+    if "--host" in args:
+        i = args.index("--host")
+        host, rest = (args[i + 1] if i + 1 < len(args) else ""), args[:i] + args[i + 2:]
+        if not host:
+            print("swarm: --host needs a host", file=sys.stderr)
+            return 1
+        ssh = ["ssh", "-t"] if sys.stdin.isatty() else ["ssh"]
+        return subprocess.run([*ssh, host, shlex.join(["dot-agent-persist", "swarm", *rest])], check=False).returncode
+    sub = args[0] if args else ""
+    if sub in ("ps", "ls"):
+        return cmd_swarm_ps()
+    if sub == "tail":
+        pos = [a for a in args[1:] if not a.startswith("-")]
+        return cmd_swarm_tail(pos[0] if pos else "latest", follow=("-f" in args or "--follow" in args))
+    if not (SWARM_DIR / "node_modules").is_dir():
+        print(f"swarm: dependencies missing; run: npm ci --prefix {SWARM_DIR}", file=sys.stderr)
+        return 1
+    # Fail here, visibly, instead of inside a window that closes the moment node exits.
+    if not (os.environ.get("AI_GATEWAY_API_KEY") or os.environ.get("VERCEL_OIDC_TOKEN") or (SWARM_DIR / ".env").is_file()):
+        print(f"swarm: no gateway key. Put AI_GATEWAY_API_KEY=... in {SWARM_DIR / '.env'} (chmod 600) or export it.", file=sys.stderr)
+        return 2
+    if sub == "schedule":
+        return cmd_swarm_schedule(args[1:])
+    resume: list[str] = []
+    if sub == "resume":
+        path = resolve_swarm_run(args[1] if len(args) > 1 else "latest")
+        if not path:
+            print("swarm: no run to resume", file=sys.stderr)
+            return 1
+        start = next((e for e in read_swarm_journal(path) if e.get("type") == "start"), {})
+        args = ["tui", *(args[2:3] or [start.get("dir") or os.getcwd()])]
+        resume = ["--resume", path.stem]
+    mode = "run" if args and args[0] == "run" else "tui"
+    if args and args[0] in ("run", "tui"):
+        args = args[1:]
+    request = ""
+    if mode == "run":
+        if not args:
+            print('Usage: dot-agent-persist swarm run "<request>" [dir]', file=sys.stderr)
+            return 1
+        request, args = args[0], args[1:]
+    cwd = os.path.abspath(os.path.expanduser(args[0])) if args else os.getcwd()
+    if not os.path.isdir(cwd):
+        print(f"swarm: not a directory: {cwd}", file=sys.stderr)
+        return 1
+    argv = (swarm_argv("run", request, cwd) if mode == "run" else swarm_argv("tui", cwd)) + resume
+    if new_window:  # fzf popup (Ctrl-N): the popup is about to close, so give the swarm its own window
+        run_tmux("new-window", "-n", "swarm", "-c", cwd, shlex.join(argv))
+        return 0
+    os.chdir(cwd)
+    if mode == "tui":  # SDK error dumps on stderr paint over the TUI; the TUI already shows an Error card
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        log_fd = os.open(STATE_DIR / "swarm.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(log_fd, 2)
+    os.execvp(argv[0], argv)
+
+
 def cmd_tui() -> int:
-    header = "Enter: jump & resume | Ctrl-S: toggle | Ctrl-M: move to session | Ctrl-Z: suspend idle"
+    header = "Enter: jump & resume | Ctrl-S: toggle | Ctrl-M: move to session | Ctrl-Z: suspend idle | Ctrl-N: swarm here"
     home = str(Path.home())
     while True:
         with RegistryLock():
@@ -1273,7 +1467,7 @@ def cmd_tui() -> int:
                 "--border=rounded",
                 "--prompt=Agents > ",
                 f"--header={header}",
-                "--expect=ctrl-s,ctrl-z,ctrl-m",
+                "--expect=ctrl-s,ctrl-z,ctrl-m,ctrl-n",
                 "--no-multi",
                 FZF_COLORS,
             ],
@@ -1300,6 +1494,8 @@ def cmd_tui() -> int:
             entry = panes.get(loc, {})
             cmd_adopt(target_arg=entry.get("pane_id", loc), use_fzf=True)
             return 0
+        if action == "ctrl-n":
+            return cmd_swarm([panes.get(loc, {}).get("cwd") or os.getcwd()], new_window=True)
 
         # Enter: switch to session/window/pane and wake it
         sess_win, _, _ = loc.partition(".")
@@ -1361,9 +1557,11 @@ def main() -> int:
         return cmd_tui()
     if cmd in ("status", "list"):
         return cmd_status()
+    if cmd == "swarm":
+        return cmd_swarm(args)
 
     print(
-        "Usage: dot-agent-persist [sync [--suspend-idle]|wake [pane]|toggle [pane]|suspend [pane]|adopt [pane] [-t session] [--split]|suspend-idle|post-restore|tui|status]",
+        "Usage: dot-agent-persist [sync [--suspend-idle]|wake [pane]|toggle [pane]|suspend [pane]|adopt [pane] [-t session] [--split]|suspend-idle|post-restore|tui|status|swarm [tui] [dir]|swarm run \"<request>\" [dir]|swarm ps|swarm tail [run] [-f]|swarm resume [run] [dir]|swarm schedule \"<OnCalendar>\" \"<request>\" [dir]|swarm schedule ls|rm <unit>; add --host H to any swarm command]",
         file=sys.stderr,
     )
     return 1
