@@ -1,11 +1,11 @@
-// Orchestrator (Ampersand) -> workers (Beam / Flint) over Vercel AI Gateway.
+// Orchestrator (Ampersand) -> workers (Beam / DeepSeek / MiniMax) over Vercel AI Gateway.
 // Auth: AI_GATEWAY_API_KEY (env or swarm/.env), or OIDC via `vercel env pull`.
 import { ToolLoopAgent, tool, isStepCount, gateway, wrapLanguageModel, type ModelMessage, type LanguageModel, type StepResult, type ToolSet } from 'ai';
 import { z } from 'zod';
 import { readFile, writeFile, readdir, mkdir, stat } from 'node:fs/promises';
 import { resolve, relative, dirname, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { route, Leases, MODELS, FREE_WORKERS, VISION_WORKERS, type Task, type Worker } from './route.ts';
+import { route, Leases, MODELS, FIRST_LINE, VISION_WORKERS, type Task, type Worker } from './route.ts';
 import { runSandboxed } from './sandbox.ts';
 import type { Journal, ResumeState } from './journal.ts';
 import type { AgentId, Emit, Gate, Mode } from './events.ts';
@@ -13,7 +13,7 @@ import { createMailbox, envelope, type Address } from './mailbox.ts';
 
 export const ORCHESTRATOR_MODEL = 'humansand/ampersand-v0.1';
 export const ORCHESTRATOR_CONTEXT = 1_000_000;
-export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, flint: 262_144, deepseek: 1_048_576, qwen: 262_144 };
+export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, deepseek: 1_048_576, minimax: 1_000_000 };
 const MAX_DISPATCHES = 12; // per batch (a run without a plan is one batch)
 const MAX_BATCHES = 8;
 const ORCH_STEPS_PER_BATCH = 25; // orchestrator turns are slow (p50 ~8s); keep each batch's loop short
@@ -21,10 +21,9 @@ const WATCHDOG_MS = 15 * 60_000; // a worker with no finished step for this long
 const SNAPSHOT_MAX = 200_000; // edit snapshots above this size carry hashes only
 
 const WORKER_INSTRUCTIONS: Record<Worker, string> = {
-  beam: 'You are the long-horizon engineer. Explore broadly, reason about architecture, then make coherent multi-file changes.',
-  flint: 'You are the fast, scoped engineer. Make the smallest correct change to the leased files. Do not explore beyond what the task needs.',
+  beam: 'You are the scoped engineer. Make the smallest correct change to the leased files. Do not explore beyond what the task needs.',
   deepseek: 'You are the long-horizon engineer with vision. Explore broadly, reason about architecture, then make coherent multi-file changes.',
-  qwen: 'You are the scoped engineer with vision. Make the smallest correct change to the leased files.',
+  minimax: 'You are the scoped engineer with vision. Make the smallest correct change to the leased files.',
 };
 const VISION_HOWTO =
   'You can see images: view_image shows you a PNG/JPEG/WebP/GIF from the workspace. To look at a page, screenshot it with run_command, e.g. ' +
@@ -37,7 +36,7 @@ const finalStep = (messages: ModelMessage[], what: string) => ({
   toolChoice: 'none' as const,
   messages: [...messages, { role: 'user' as const, content: `Step budget used up: no more tool calls. Write your final report now: ${what}` }],
 });
-const STEP_CAP: Record<Worker, number> = { beam: 40, flint: 25, deepseek: 40, qwen: 25 }; // loop guard; Flint was 15 and ran out on most feature tasks (2026-11-22)
+const STEP_CAP: Record<Worker, number> = { beam: 40, deepseek: 40, minimax: 25 }; // loop guard; scoped tasks need ≥25 (Flint ran out at 15, 2026-11-22)
 
 type Progress = { worker?: Worker; reason?: string; attempt?: number; log: string[]; done: boolean; summary?: string };
 type DispatchInput = Omit<Task, 'attempt' | 'force'> & { context?: string[] };
@@ -209,7 +208,7 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
   async function runWorker(input: DispatchInput, signal: AbortSignal | undefined, onProgress: (p: Progress) => void, force?: Worker): Promise<string> {
     const p: Progress = { log: [], done: false };
     // Attempts are counted per task id AND per lease set, not per goal text: Ampersand rewords retries, which used to reset
-    // the count and hand a failed task back to Flint as "attempt 1" (run 2026-11-22T18-03: relay-sessions, twice).
+    // the count and hand a failed task back to the first worker as "attempt 1" (run 2026-11-22T18-03: relay-sessions, twice).
     const idKey = `id:${input.id}`;
     // Escalations sometimes arrive with files=[] (run 3: Beam got no writable files); reuse the previous attempt's lease set.
     if (seen.has(idKey) && input.files.length === 0) input = { ...input, files: prevFiles.get(idKey) ?? [] };
@@ -232,7 +231,7 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
     const agent: AgentId = `task:${input.id}`;
     const mine = new AbortController();
     running.set(input.id, mine);
-    let worker: Worker = 'flint';
+    let worker: Worker = 'beam';
     let release = () => {};
     try {
       const task: Task = { ...input, files, attempt, force };
@@ -284,6 +283,8 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
           },
           stopWhen: isStepCount(cap),
           maxRetries: 3, // beam-free is per-model rate-limited on the free tier
+          // The SDK doesn't know MiniMax-M3.1-Flash and caps its output at 4096 tokens unless this is set (smoke 2026-11-23).
+          ...(worker === 'minimax' ? { maxOutputTokens: 65_536 } : {}),
           // no stripReasoning here: Beam rejects requests without its earlier reasoning_content (run 2, 2026-11-21)
           prepareStep: async ({ stepNumber, messages }) => {
             if (gate) await gate.checkpoint(agent, sig);
@@ -377,7 +378,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
 
   const dispatch = tool({
     description:
-      'Delegate one coding task. The router picks Beam (long-horizon/large context) or Flint (fast, scoped); a third attempt goes to a paid model. Set visual=true for web/UI work the worker must look at (vision models: Qwen scoped, DeepSeek large). ' +
+      'Delegate one coding task. The router picks Beam (free, scoped; one at a time) or DeepSeek (large/long-horizon, or a failed Beam task); a third attempt goes to MiniMax. Set visual=true for web/UI work the worker must look at (vision models: MiniMax scoped, DeepSeek large). ' +
       'Declare every file the worker must write; tasks with overlapping files are rejected until the other finishes.',
     inputSchema: z.object({
       id: z.string(),
@@ -385,7 +386,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       goal: z.string(),
       files: z.array(z.string()).default([]),
       estTokens: z.number().int().nonnegative(),
-      prefer: z.enum(FREE_WORKERS).optional(),
+      prefer: z.enum(FIRST_LINE).optional(),
       context: z.array(z.string()).default([]).describe('Spec/reference files the worker needs (e.g. the task brief, shared types). They are read once and put in the worker prompt, so workers do not spend steps re-reading them.'),
       visual: z.boolean().optional().describe('true when the worker must LOOK at something: web/UI work, screenshots, design mockups, images, diagrams (architecture/flow/sequence). Routes to a vision model that can screenshot pages and view images.'),
     }),
@@ -499,7 +500,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
     instructions: `You coordinate two coding workers and the user. Workspace: ${ROOT}
 - Read specs/small files yourself with read_file/list_files; dispatch only real work, never "read this file for me".
 - Break the request into tasks; dispatch them via the dispatch tool. Prefer one exploration task before edits on unfamiliar code.
-- Track the shared goal. If two worker reports contradict each other, do not pick silently: dispatch a Beam "architecture" task to reconcile, or ask the user.
+- Track the shared goal. If two worker reports contradict each other, do not pick silently: dispatch an "architecture" task to reconcile, or ask the user.
 - A failed task may be retried once with the SAME goal text (the router escalates it). Never retry more than that.
 - Workers can run tests in a sandbox; ask for that in goals that change code.
 - If the request needs more than ~10 dispatches, call plan FIRST to split it into batches; work one batch at a time and call batch_done after each. Never try to fit a big request into one batch.
@@ -610,7 +611,7 @@ export const makeSafe = (ROOT: string) => (p: string) => {
 const IMAGE_TYPES: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
 const IMAGE_MAX = 5 * 1024 * 1024;
 
-// Vision workers only: Beam/Flint are text-only and would reject image content.
+// Vision workers only: Beam is text-only and would reject image content.
 export function viewImageTool(ROOT: string) {
   const safe = makeSafe(ROOT);
   return tool({

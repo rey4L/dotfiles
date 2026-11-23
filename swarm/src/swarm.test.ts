@@ -10,7 +10,7 @@ import type { SwarmEvent, Gate } from './events.ts';
 
 const base: Task = { id: 't1', kind: 'bugfix', goal: 'x', files: ['a.ts'], estTokens: 20_000, attempt: 1 };
 test('force overrides every routing rule', () => {
-  assert.equal(route({ ...base, kind: 'architecture', force: 'flint' }).worker, 'flint');
+  assert.equal(route({ ...base, kind: 'architecture', force: 'beam' }).worker, 'beam');
   assert.match(route({ ...base, force: 'beam' }).reason, /manual override/);
 });
 
@@ -23,7 +23,7 @@ async function ws() {
   return dir;
 }
 
-test('mock run: dispatch -> flint edits file, events + journal emitted', async () => {
+test('mock run: dispatch -> beam edits file, events + journal emitted', async () => {
   const dir = await ws();
   const events: SwarmEvent[] = [];
   const journal: string[] = [];
@@ -32,7 +32,7 @@ test('mock run: dispatch -> flint edits file, events + journal emitted', async (
     journal: (e) => journal.push(e.type),
     models: {
       orch: scripted('orch', [dispatchTurn('fix', ['a.txt']), { text: 'All done.' }]),
-      flint: scripted('flint', [
+      beam: scripted('beam', [
         { tools: [{ name: 'edit_file', input: { path: 'a.txt', old_string: 'two', new_string: 'TWO' } }] },
         { text: 'STATUS: ok changed a.txt' },
       ]),
@@ -46,7 +46,7 @@ test('mock run: dispatch -> flint edits file, events + journal emitted', async (
   const edit = events.find((e) => e.type === 'file.edit');
   assert.ok(edit && edit.type === 'file.edit' && edit.before === 'one\ntwo\nthree\n' && edit.after === 'one\nTWO\nthree\n');
   const res = events.find((e) => e.type === 'task.result');
-  assert.ok(res && res.type === 'task.result' && res.status === 'ok' && res.worker === 'flint');
+  assert.ok(res && res.type === 'task.result' && res.status === 'ok' && res.worker === 'beam');
   assert.deepEqual(journal.filter((t) => ['dispatch', 'result'].includes(t)), ['dispatch', 'result']); // legacy journal unchanged
 });
 
@@ -62,7 +62,7 @@ test('gate deny blocks run_command (sandbox never runs)', async () => {
     gate, emit: (e) => { if (e.type === 'tool.end') outputs.push(e.outputTail); },
     models: {
       orch: scripted('orch', [dispatchTurn('t', []), { text: 'ok' }]),
-      flint: scripted('flint', [{ tools: [{ name: 'run_command', input: { command: 'rm -rf .' } }] }, { text: 'STATUS: failed denied' }]),
+      beam: scripted('beam', [{ tools: [{ name: 'run_command', input: { command: 'rm -rf .' } }] }, { text: 'STATUS: failed denied' }]),
     },
   });
   await swarm.generate({ prompt: 'x' });
@@ -79,7 +79,7 @@ test('destructive edit asks the gate; small edit does not', async () => {
     gate,
     models: {
       orch: scripted('orch', [dispatchTurn('t', ['big.txt', 'a.txt']), { text: 'ok' }]),
-      flint: scripted('flint', [
+      beam: scripted('beam', [
         { tools: [{ name: 'edit_file', input: { path: 'a.txt', old_string: 'one', new_string: '1' } }] },
         { tools: [{ name: 'edit_file', input: { path: 'big.txt', old_string: 'x'.repeat(1000), new_string: '' } }] },
         { text: 'STATUS: ok' },
@@ -91,7 +91,7 @@ test('destructive edit asks the gate; small edit does not', async () => {
   assert.equal(await readFile(join(dir, 'big.txt'), 'utf8'), 'keep\n');
 });
 
-test('cancel aborts a running worker; redispatch with force reruns it on beam', async () => {
+test('cancel aborts a running worker; redispatch with force reruns it on deepseek', async () => {
   const dir = await ws();
   const events: SwarmEvent[] = [];
   let swarm!: ReturnType<typeof createSwarm>;
@@ -107,16 +107,16 @@ test('cancel aborts a running worker; redispatch with force reruns it on beam', 
     gate, emit: (e) => events.push(e),
     models: {
       orch: scripted('orch', [dispatchTurn('slow', []), { text: 'reported' }]),
-      flint: scripted('flint', [{ tools: [{ name: 'list_files', input: {} }] }, { text: 'STATUS: ok never' }]),
-      beam: scripted('beam', [{ text: 'STATUS: ok rerun on beam' }]),
+      beam: scripted('beam', [{ tools: [{ name: 'list_files', input: {} }] }, { text: 'STATUS: ok never' }]),
+      deepseek: scripted('deepseek', [{ text: 'STATUS: ok rerun on deepseek' }]),
     },
   });
   await swarm.generate({ prompt: 'x' });
   const r1 = events.find((e) => e.type === 'task.result');
   assert.ok(r1 && r1.type === 'task.result' && r1.status === 'cancelled', JSON.stringify(r1));
-  const out = await swarm.controls.redispatch('slow', 'beam');
-  assert.match(out, /^\[beam: manual override/);
-  assert.ok(events.some((e) => e.type === 'dispatch' && e.worker === 'beam' && e.forcedBy === 'user'));
+  const out = await swarm.controls.redispatch('slow', 'deepseek');
+  assert.match(out, /^\[deepseek: manual override/);
+  assert.ok(events.some((e) => e.type === 'dispatch' && e.worker === 'deepseek' && e.forcedBy === 'user'));
 });
 
 test('lease clash emits lease.conflict with the holder', async () => {
@@ -126,7 +126,7 @@ test('lease clash emits lease.conflict with the holder', async () => {
     emit: (e) => events.push(e),
     models: {
       orch: scripted('orch', [{ tools: [dispatchTurn('a', ['a.txt']).tools[0], dispatchTurn('b', ['a.txt']).tools[0]] }, { text: 'ok' }]),
-      flint: scripted('flint', [{ text: 'STATUS: ok', delayMs: 20 }, { text: 'STATUS: ok' }]),
+      beam: scripted('beam', [{ text: 'STATUS: ok', delayMs: 20 }, { text: 'STATUS: ok' }]),
     },
   });
   await swarm.generate({ prompt: 'x' });

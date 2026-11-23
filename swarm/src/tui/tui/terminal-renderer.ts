@@ -955,7 +955,7 @@ export class TerminalRenderer {
     switch (s.kind) {
       case 'banner': {
         const t = sanitizeTerminalText(s.content || 'swarm');
-        const lines = [`${c.magenta}✻${c.reset} ${c.bold}swarm${c.reset}  ${c.dim}Ampersand → Beam / Flint${c.reset}`, `  ${c.dim}${t}${c.reset}`, `  ${c.dim}/help for commands · shift+tab cycles modes · ctrl+o transcript${c.reset}`];
+        const lines = [`${c.magenta}✻${c.reset} ${c.bold}swarm${c.reset}  ${c.dim}Ampersand → Beam / DeepSeek / MiniMax${c.reset}`, `  ${c.dim}${t}${c.reset}`, `  ${c.dim}/help for commands · shift+tab cycles modes · ctrl+o transcript${c.reset}`];
         const w = Math.min(inner - 2, Math.max(...lines.map(visibleLength)) + 2);
         return [`${c.dim}╭${'─'.repeat(w)}╮${c.reset}`, ...lines.map((l) => `${c.dim}│${c.reset} ${l}${' '.repeat(Math.max(0, w - 1 - visibleLength(l)))}${c.dim}│${c.reset}`), `${c.dim}╰${'─'.repeat(w)}╯${c.reset}`, ''];
       }
@@ -1117,7 +1117,7 @@ export class TerminalRenderer {
   #workerLines(width: number): string[] {
     const now = Date.now();
     const used = new Set([...this.#workers.values()].map((w) => w.worker));
-    return (['beam', 'flint', 'deepseek', 'qwen'] as const).filter((k) => k === 'beam' || k === 'flint' || used.has(k)).map((k) => {
+    return (['beam', 'deepseek', 'minimax'] as const).filter((k) => k !== 'minimax' || used.has(k)).map((k) => {
       const a = AGENTS[k];
       const mine = [...this.#workers.values()].filter((w) => w.worker === k);
       const active = mine.filter((w) => w.endedAt == null);

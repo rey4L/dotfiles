@@ -14,10 +14,9 @@ export type AgentKey = 'user' | 'orch' | Worker;
 export const AGENTS: Record<AgentKey, { name: string; role: string; model?: string; color: string }> = {
   user: { name: 'You', role: 'User', color: c.cyan },
   orch: { name: 'Ampersand', role: 'Orchestrator', model: 'ampersand-v0.1', color: c.magenta },
-  beam: { name: 'Beam', role: 'Heavy Coder', model: 'beam-free', color: c.orange },
-  flint: { name: 'Flint', role: 'Fast Coder', model: 'flint-v1.0', color: c.teal },
-  deepseek: { name: 'DeepSeek', role: 'Paid Heavy Coder', model: 'deepseek-v4.1-flash-1017', color: c.blue },
-  qwen: { name: 'Qwen', role: 'Paid Fast Coder', model: 'qwen3.8-27b', color: c.amber },
+  beam: { name: 'Beam', role: 'Scoped Coder', model: 'beam-free', color: c.orange },
+  deepseek: { name: 'DeepSeek', role: 'Heavy Coder', model: 'deepseek-v4.1-flash-1017', color: c.blue },
+  minimax: { name: 'MiniMax', role: 'Final-attempt Coder', model: 'minimax-m3.1-flash', color: c.amber },
 };
 export const badge = (k: AgentKey) => `${AGENTS[k].name} · ${AGENTS[k].role}`;
 
@@ -140,7 +139,7 @@ export function dispatchCard(o: {
   if (!o.expanded && log.length > 3) body.push(`${c.dim}  … ${log.length - 3} earlier steps${c.reset}`);
   body.push(...shown.map((l) => `${c.dim}  ↳${c.reset} ${logLine(l)}`));
   if (o.finished && p.summary) {
-    const s = safe(p.summary.trim().replace(/^\[(beam|flint): [^\]]*\] attempt \d+\n/, '')).split('\n');
+    const s = safe(p.summary.trim().replace(/^\[(\w+): [^\]]*\] attempt \d+\n/, '')).split('\n');
     const sl = o.expanded ? s : s.slice(0, 4);
     body.push(`${c.dim}result:${c.reset}`, ...sl.map((l) => `  ${l}`));
     if (!o.expanded && s.length > 4) body.push(`${c.dim}  … ${s.length - 4} more lines${c.reset}`);
@@ -222,7 +221,7 @@ export function exploreSummary(tools: { name: string; input: unknown }[]): { tit
 // Result text without the orchestrator-facing prefix and the STATUS line.
 export function cleanSummary(summary: string): string[] {
   return safe(summary.trim())
-    .replace(/^\[(beam|flint): [^\]]*\] attempt \d+\n/, '')
+    .replace(/^\[(\w+): [^\]]*\] attempt \d+\n/, '')
     .split('\n')
     .filter((l) => l.trim() && !/^\**STATUS:\s*(ok|failed)\**\s*$/i.test(l.trim()));
 }

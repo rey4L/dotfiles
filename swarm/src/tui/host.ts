@@ -50,8 +50,9 @@ export function createHost(o: { runId?: string; titleLabel?: string; onResume?: 
     },
     models: () => [
       `Ampersand · Orchestrator  ${ORCHESTRATOR_MODEL}`,
-      `Beam · Heavy Coder        ${MODELS.beam}`,
-      `Flint · Fast Coder        ${MODELS.flint}`,
+      `Beam · Scoped Coder       ${MODELS.beam}`,
+      `DeepSeek · Heavy Coder    ${MODELS.deepseek}`,
+      `MiniMax · Final attempt   ${MODELS.minimax}`,
       '(all via Vercel AI Gateway; switching models is not supported from the TUI)',
     ].join('\n'),
     runs: () => {

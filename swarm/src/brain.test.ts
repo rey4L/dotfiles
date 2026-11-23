@@ -29,11 +29,11 @@ test('compaction happens once: steps after a batch handoff stay visible to the o
 test('resume restores plan position and attempt counts', async () => {
   const dir = await tmp();
   const journal: JournalEvent[] = [];
-  const failFlint = scripted('flint', () => ({ text: 'STATUS: failed could not' }));
+  const failBeam = scripted('beam', () => ({ text: 'STATUS: failed could not' }));
   const run1 = createSwarm(dir, {
     journal: (e) => journal.push(e),
     models: { orch: orch([call('plan', { batches, verify: 'true' }), call('batch_done', { summary: 'a done' }),
-      call('dispatch', { id: 'tb', kind: 'boilerplate', goal: 'make b', files: ['b.txt'], estTokens: 100 }), { text: 'stopped' }]), flint: failFlint },
+      call('dispatch', { id: 'tb', kind: 'boilerplate', goal: 'make b', files: ['b.txt'], estTokens: 100 }), { text: 'stopped' }]), beam: failBeam },
   });
   await run1.generate({ prompt: 'go' });
   const st = resumeState(journal);
@@ -45,26 +45,26 @@ test('resume restores plan position and attempt counts', async () => {
   const run2 = createSwarm(dir, {
     resume: st, emit: (e) => events.push(e),
     models: { orch: orch([call('dispatch', { id: 'tb', kind: 'boilerplate', goal: 'make b again', files: ['b.txt'], estTokens: 100 }),
-      call('batch_done', { summary: 'b done' }), { text: 'end' }], prompts), beam: scripted('beam', () => ({ text: 'STATUS: ok' })) },
+      call('batch_done', { summary: 'b done' }), { text: 'end' }], prompts), deepseek: scripted('deepseek', () => ({ text: 'STATUS: ok' })) },
   });
   await run2.generate({ prompt: 'continue' });
   const d = events.find((e) => e.type === 'dispatch');
-  assert.ok(d?.type === 'dispatch' && d.attempt === 2 && d.worker === 'beam', 'second attempt escalates across the resume');
+  assert.ok(d?.type === 'dispatch' && d.attempt === 2 && d.worker === 'deepseek', 'second attempt escalates across the resume');
   assert.match(prompts[2], /b2 \[done\]: b done[\s\S]*Current batch 3\/3 \(b3\)/, 'batch_done works after resume');
 });
 
 test('a transient provider error retries the same worker once without counting an attempt', async () => {
   const dir = await tmp();
   let n = 0;
-  const flint = scripted('flint', () => (n++ === 0 ? { fail: 'inference service temporarily unavailable' } : { text: 'STATUS: ok fine' }));
+  const beam = scripted('beam', () => (n++ === 0 ? { fail: 'inference service temporarily unavailable' } : { text: 'STATUS: ok fine' }));
   const events: SwarmEvent[] = [];
   const swarm = createSwarm(dir, {
     retryDelayMs: 0, emit: (e) => events.push(e),
-    models: { orch: orch([call('dispatch', { id: 't', kind: 'boilerplate', goal: 'x', files: ['x.txt'], estTokens: 10 }), { text: 'end' }]), flint },
+    models: { orch: orch([call('dispatch', { id: 't', kind: 'boilerplate', goal: 'x', files: ['x.txt'], estTokens: 10 }), { text: 'end' }]), beam },
   });
   await swarm.generate({ prompt: 'go' });
   const r = events.find((e) => e.type === 'task.result');
-  assert.ok(r?.type === 'task.result' && r.status === 'ok' && r.worker === 'flint');
+  assert.ok(r?.type === 'task.result' && r.status === 'ok' && r.worker === 'beam');
   assert.equal(events.filter((e) => e.type === 'dispatch').length, 1);
   assert.ok(events.some((e) => e.type === 'ratelimit' && /transient/.test(e.message)));
 });
@@ -73,9 +73,9 @@ test('context files are inlined into the worker prompt and a re-read is elided',
   const dir = await tmp();
   await writeFile(join(dir, 'SPEC.md'), 'THE-SPEC-BODY');
   const prompts: string[] = [];
-  const flint = scripted('flint', (i, p) => { prompts.push(p); return i % 2 === 0 ? call('read_file', { path: 'SPEC.md' }) : { text: 'STATUS: ok' }; });
+  const beam = scripted('beam', (i, p) => { prompts.push(p); return i % 2 === 0 ? call('read_file', { path: 'SPEC.md' }) : { text: 'STATUS: ok' }; });
   const d = (id: string) => call('dispatch', { id, kind: 'boilerplate', goal: `do ${id}`, files: [`${id}.txt`], estTokens: 10, context: ['SPEC.md'] });
-  const swarm = createSwarm(dir, { models: { orch: orch([d('t1'), d('t2'), { text: 'end' }]), flint } });
+  const swarm = createSwarm(dir, { models: { orch: orch([d('t1'), d('t2'), { text: 'end' }]), beam } });
   await swarm.generate({ prompt: 'go' });
   assert.ok(prompts[0].includes('THE-SPEC-BODY') && prompts[2].includes('THE-SPEC-BODY'), 'both tasks got the spec');
   assert.ok(prompts[1].includes('unchanged since you last read SPEC.md'), 'read_file elided');
@@ -83,12 +83,12 @@ test('context files are inlined into the worker prompt and a re-read is elided',
 
 test('a worker with no write by half its step cap gets a system nudge', async () => {
   const prompts: string[] = [];
-  const flint = scripted('flint', (i, p) => { prompts.push(p); return i < 14 ? call('list_files', {}) : { text: 'STATUS: failed blocked' }; });
-  const swarm = createSwarm(await tmp(), { models: { orch: orch([call('dispatch', { id: 't', kind: 'feature', goal: 'x', files: ['x.ts'], estTokens: 10 }), { text: 'end' }]), flint } });
+  const beam = scripted('beam', (i, p) => { prompts.push(p); return i < 22 ? call('list_files', {}) : { text: 'STATUS: failed blocked' }; });
+  const swarm = createSwarm(await tmp(), { models: { orch: orch([call('dispatch', { id: 't', kind: 'feature', goal: 'x', files: ['x.ts'], estTokens: 10 }), { text: 'end' }]), beam } });
   await swarm.generate({ prompt: 'go' });
-  assert.ok(!prompts[11].includes('without changing any file'));
-  assert.match(prompts[12], /From: system[\s\S]*used 12 of 25 steps without changing any file/);
-  assert.ok(prompts[13].includes('used 12 of 25 steps'), 'injected message persists into later steps');
+  assert.ok(!prompts[19].includes('without changing any file'));
+  assert.match(prompts[20], /From: system[\s\S]*used 20 of 40 steps without changing any file/);
+  assert.ok(prompts[21].includes('used 20 of 40 steps'), 'injected message persists into later steps');
 });
 
 test('mailbox: worker -> orch, human -> running worker, inbox file -> orch; delivered at step boundaries', async () => {
@@ -99,14 +99,14 @@ test('mailbox: worker -> orch, human -> running worker, inbox file -> orch; deli
   const oPrompts: string[] = [];
   const wPrompts: string[] = [];
   let swarm!: ReturnType<typeof createSwarm>;
-  const flint = scripted('flint', (i, p) => {
+  const beam = scripted('beam', (i, p) => {
     wPrompts.push(p);
     if (i === 0) { swarm.controls.send('task:t', 'use tabs please'); return call('send_message', { to: 'orch', text: 'spec says X but Y exists' }); }
     return i === 1 ? call('list_files', {}) : { text: 'STATUS: ok' };
   });
   swarm = createSwarm(dir, {
     inbox, journal: (e) => journal.push(e),
-    models: { orch: orch([call('dispatch', { id: 't', kind: 'feature', goal: 'x', files: ['x.ts'], estTokens: 10 }), { text: 'end' }], oPrompts), flint },
+    models: { orch: orch([call('dispatch', { id: 't', kind: 'feature', goal: 'x', files: ['x.ts'], estTokens: 10 }), { text: 'end' }], oPrompts), beam },
   });
   await swarm.generate({ prompt: 'go' });
   assert.match(oPrompts[0], /\[MESSAGES\][\s\S]*From: external:claude[\s\S]*hello from the inbox/);
@@ -124,10 +124,10 @@ test('modes: plan refuses dispatch; ask gates every file write; setMode emits + 
   const asked: string[] = [];
   const gate = { checkpoint: async () => {}, beforeTool: async (_a: unknown, tool: string) => { asked.push(tool); return { approve: tool !== 'write_file' }; } };
   const results: string[] = [];
-  const flint = scripted('flint', (i, p) => (i === 0 ? call('write_file', { path: 'x.txt', content: 'x' }) : (results.push(p), { text: 'STATUS: failed denied' })));
+  const beam = scripted('beam', (i, p) => (i === 0 ? call('write_file', { path: 'x.txt', content: 'x' }) : (results.push(p), { text: 'STATUS: failed denied' })));
   const disp = call('dispatch', { id: 't', kind: 'boilerplate', goal: 'x', files: ['x.txt'], estTokens: 10 });
   const prompts: string[] = [];
-  const swarm = createSwarm(dir, { gate, mode: 'plan', emit: (e) => events.push(e), journal: (e) => journal.push(e), models: { orch: orch([disp, { text: 'plan shown' }, disp, { text: 'end' }], prompts), flint } });
+  const swarm = createSwarm(dir, { gate, mode: 'plan', emit: (e) => events.push(e), journal: (e) => journal.push(e), models: { orch: orch([disp, { text: 'plan shown' }, disp, { text: 'end' }], prompts), beam } });
   await swarm.generate({ prompt: 'plan it' });
   assert.ok(prompts[1].includes('REFUSED: plan mode'));
   swarm.controls.setMode('ask');

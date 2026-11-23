@@ -18,8 +18,8 @@ test('blank worker text -> NO FINAL REPORT summary; escalation inherits files; t
     journal: (e) => journal.push(e),
     models: {
       orch: scripted('orch', [disp(['a.txt']), disp([]), { text: 'done' }]),
-      flint: scripted('flint', [{ tools: [{ name: 'read_file', input: { path: 'a.txt' } }] }, { text: '' }]),
-      beam: scripted('beam', [{ text: 'STATUS: ok' }]),
+      beam: scripted('beam', [{ tools: [{ name: 'read_file', input: { path: 'a.txt' } }] }, { text: '' }]),
+      deepseek: scripted('deepseek', [{ text: 'STATUS: ok' }]),
     },
   });
   await swarm.generate({ prompt: 'go' });
@@ -27,7 +27,7 @@ test('blank worker text -> NO FINAL REPORT summary; escalation inherits files; t
   assert.match(results[0].type === 'result' ? results[0].summary : '', /NO FINAL REPORT.*1 tool calls/s);
   const dispatches = journal.filter((e) => e.type === 'dispatch');
   assert.equal(dispatches.length, 2);
-  assert.ok(dispatches[1].type === 'dispatch' && dispatches[1].worker === 'beam' && dispatches[1].files[0] === 'a.txt');
+  assert.ok(dispatches[1].type === 'dispatch' && dispatches[1].worker === 'deepseek' && dispatches[1].files[0] === 'a.txt');
   assert.ok(journal.some((e) => e.type === 'worker' && /→ read_file: .*one/.test(e.line)));
 });
 
@@ -40,7 +40,7 @@ test('step caps end with a forced report, not silence (orchestrator + worker)', 
     models: {
       // orchestrator: one dispatch, then loops on status forever unless told the budget is used up
       orch: scripted('orch', (i, p) => (budget(p) ? { text: 'ORCH REPORT' } : i === 0 ? disp(['a.txt']) : { tools: [{ name: 'status', input: {} }] })),
-      flint: scripted('flint', (_i, p) => (budget(p) ? { text: 'STATUS: failed\nWORKER REPORT' } : { tools: [{ name: 'list_files', input: {} }] })),
+      beam: scripted('beam', (_i, p) => (budget(p) ? { text: 'STATUS: failed\nWORKER REPORT' } : { tools: [{ name: 'list_files', input: {} }] })),
     },
   });
   const r = await swarm.generate({ prompt: 'go' });
@@ -59,13 +59,13 @@ test('reworded retry of the same task still escalates; success resets the count'
     journal: (e) => journal.push(e),
     models: {
       orch: scripted('orch', [d('s', 'write a'), d('s', 'write a, and also fix the tail'), d('s-again', 'new work on a'), { text: 'done' }]),
-      flint: scripted('flint', [{ text: 'STATUS: failed' }, { text: 'STATUS: ok' }]),
-      beam: scripted('beam', [{ text: 'STATUS: ok' }]),
+      beam: scripted('beam', [{ text: 'STATUS: failed' }, { text: 'STATUS: ok' }]),
+      deepseek: scripted('deepseek', [{ text: 'STATUS: ok' }]),
     },
   });
   await swarm.generate({ prompt: 'go' });
   const ds = journal.filter((e) => e.type === 'dispatch').map((e) => (e.type === 'dispatch' ? `${e.worker}:${e.attempt}` : ''));
-  assert.deepEqual(ds, ['flint:1', 'beam:2', 'flint:1']);
+  assert.deepEqual(ds, ['beam:1', 'deepseek:2', 'beam:1']);
 });
 
 test('plan accepts tasks sent as {id, goal} objects', async () => {
@@ -87,7 +87,7 @@ test('long worker report keeps its STATUS verdict in the summary', async () => {
     journal: (e) => journal.push(e),
     models: {
       orch: scripted('orch', [disp(['a.txt']), { text: 'done' }]),
-      flint: scripted('flint', [{ text: `STATUS: ok\n${'x'.repeat(3000)}` }]),
+      beam: scripted('beam', [{ text: `STATUS: ok\n${'x'.repeat(3000)}` }]),
     },
   });
   await swarm.generate({ prompt: 'go' });
@@ -104,10 +104,10 @@ test('a dispatch rejected for a lease conflict does not count as an attempt', as
     journal: (e) => journal.push(e),
     models: {
       orch: scripted('orch', [{ tools: [d('first', 'g1'), d('clash', 'g2')] }, { tools: [d('clash2', 'g2 again')] }, { text: 'done' }]),
-      flint: scripted('flint', () => ({ delayMs: 20, text: 'STATUS: ok' })),
+      beam: scripted('beam', () => ({ delayMs: 20, text: 'STATUS: ok' })),
     },
   });
   await swarm.generate({ prompt: 'go' });
   const ds = journal.filter((e) => e.type === 'dispatch').map((e) => (e.type === 'dispatch' ? `${e.id}:${e.worker}:${e.attempt}` : ''));
-  assert.deepEqual(ds, ['first:flint:1', 'clash2:flint:1']);
+  assert.deepEqual(ds, ['first:beam:1', 'clash2:beam:1']);
 });

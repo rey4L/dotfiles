@@ -43,10 +43,10 @@ test('logLine: engine log JSON (even truncated) becomes "tool  arg"', () => {
 
 test('dispatch card: worker, badge, collapsed goal, failure detection', () => {
   const card = dispatchCard({
-    input: { id: 'fix', kind: 'bugfix', goal: '1\n2\n3\n4\n5' }, progress: { worker: 'flint', summary: 'NO FINAL REPORT: stopped' },
+    input: { id: 'fix', kind: 'bugfix', goal: '1\n2\n3\n4\n5' }, progress: { worker: 'beam', summary: 'NO FINAL REPORT: stopped' },
     finished: true, expanded: false, focused: false,
   });
-  assert.match(plain(card.header), /◆ dispatch \[bugfix\] fix → Flint · flint-v1\.0 {2}✗ failed/);
+  assert.match(plain(card.header), /◆ dispatch \[bugfix\] fix → Beam · beam-free {2}✗ failed/);
   assert.ok(card.body.some((l) => /2 more lines/.test(plain(l))));
 });
 
@@ -84,5 +84,5 @@ test('inline: headings are bold without glyphs; tool summaries and explore group
   assert.match(toolSummary('edit_file', 'DENIED: x is not in your lease'), /^DENIED/);
   assert.deepEqual(exploreSummary([{ name: 'read_file', input: { path: 'a.py' } }, { name: 'list_files', input: { dir: '.' } }, { name: 'read_file', input: { path: 'b.py' } }]),
     { title: 'Read 2 files, listed 1 directory', detail: 'a.py, ., b.py' });
-  assert.deepEqual(cleanSummary('[flint: scoped task] attempt 1\nSTATUS: ok\nEdited app.py.'), ['Edited app.py.']);
+  assert.deepEqual(cleanSummary('[beam: scoped task] attempt 1\nSTATUS: ok\nEdited app.py.'), ['Edited app.py.']);
 });

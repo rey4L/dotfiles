@@ -16,7 +16,7 @@ const batches = [
 const call = (name: string, input: unknown) => ({ tools: [{ name, input }] });
 const dispatch = (f: string) => call('dispatch', { id: `t-${f}`, kind: 'boilerplate', goal: `create ${f}`, files: [f], estTokens: 1000 });
 // Worker: create its leased file, then report ok.
-const flint = () => scripted('flint', (_i, prompt) => {
+const beam = () => scripted('beam', (_i, prompt) => {
   if (prompt.includes('created ')) return { text: 'STATUS: ok created the file' };
   const f = prompt.match(/may only write: (\w+\.txt)/)![1];
   return call('write_file', { path: f, content: f });
@@ -37,7 +37,7 @@ test('big request: plan splits into batches, each verified, context compacted be
   const swarm = createSwarm(dir, {
     emit: (e) => events.push(e),
     journal: (e) => journal.push(e),
-    models: { orch: scripted('orch', (i, p) => { prompts.push(p); return turns[i] ?? { text: 'done' }; }), flint: flint() },
+    models: { orch: scripted('orch', (i, p) => { prompts.push(p); return turns[i] ?? { text: 'done' }; }), beam: beam() },
   });
   const r = await swarm.generate({ prompt: 'build all three files' });
   assert.equal(r.text, 'All three batches done.');
@@ -70,7 +70,7 @@ test('verify failing twice halts the plan: no further dispatches', async () => {
   ];
   const swarm = createSwarm(dir, {
     emit: (e) => events.push(e),
-    models: { orch: scripted('orch', (i, p) => { results.push(p); return turns[i] ?? { text: 'done' }; }), flint: flint() },
+    models: { orch: scripted('orch', (i, p) => { results.push(p); return turns[i] ?? { text: 'done' }; }), beam: beam() },
   });
   await swarm.generate({ prompt: 'build' });
   assert.ok(results[3].includes('VERIFY FAILED for batch b1'));

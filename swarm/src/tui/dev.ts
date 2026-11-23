@@ -31,10 +31,10 @@ const swarm = createSwarm(dir, {
       },
       {
         delayMs: slow,
-        text: '## Done\n\n- `cmd_wake` now calls load_registry and sync_registry stays untouched.\n- Risk: **none** found; snake_case like recover_agent_by_title must not italicise.\n\n| task | worker | status |\n|---|---|---|\n| fix-cmd-wake | flint | ok |',
+        text: '## Done\n\n- `cmd_wake` now calls load_registry and sync_registry stays untouched.\n- Risk: **none** found; snake_case like recover_agent_by_title must not italicise.\n\n| task | worker | status |\n|---|---|---|\n| fix-cmd-wake | beam | ok |',
       },
     ]),
-    flint: scripted('flint', [
+    beam: scripted('beam', [
       { delayMs: slow, tools: [{ name: 'read_file', input: { path: 'app.py' } }] },
       { delayMs: slow, tools: [{ name: 'edit_file', input: { path: 'app.py', old_string: '    pass', new_string: '    return load_registry()' } }] },
       { delayMs: slow, tools: [{ name: 'run_command', input: { command: 'python3 -c "import app; print(app.cmd_wake())"' } }] },
