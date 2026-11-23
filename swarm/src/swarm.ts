@@ -193,9 +193,12 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
         model: model(worker),
         instructions: `${WORKER_INSTRUCTIONS[worker]}
 ${attempt > 1 ? 'Earlier attempts at this task failed: inspect the current workspace state before changing anything.\n' : ''}${VISION_WORKERS.includes(worker) ? VISION_HOWTO + '\n' : ''}You may only write: ${files.join(', ') || '(nothing — read-only task)'}.
+Use web_search/web_fetch only for docs or facts the workspace cannot answer.
 If you changed code and tests exist or you wrote them, run them with run_command and report the result; never claim tests pass without running them.
 End with: STATUS: ok|failed, then a summary under 200 words (files changed, tests run + result, open risks).`,
-        tools: { ...fsTools(input.id, agent), ...(VISION_WORKERS.includes(worker) ? instrument({ view_image: viewImageTool(ROOT) }, agent, emit) : {}), run_command: instrument({ run_command: runCommandTool(agent) }, agent, emit).run_command },
+        tools: { ...fsTools(input.id, agent), ...(VISION_WORKERS.includes(worker) ? instrument({ view_image: viewImageTool(ROOT) }, agent, emit) : {}), run_command: instrument({ run_command: runCommandTool(agent) }, agent, emit).run_command,
+          // Run at the gateway ($0.75 per 1K calls each), not in the sandbox, which stays offline.
+          web_search: gateway.tools.deepseekSearch(), web_fetch: gateway.tools.deepseekFetch() },
         stopWhen: isStepCount(STEP_CAP[worker]),
         maxRetries: 3, // beam-free is per-model rate-limited on the free tier
         // no stripReasoning here: Beam rejects requests without its earlier reasoning_content (run 2, 2026-11-21)

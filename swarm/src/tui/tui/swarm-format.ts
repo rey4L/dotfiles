@@ -16,7 +16,7 @@ export const AGENTS: Record<AgentKey, { name: string; role: string; model?: stri
   orch: { name: 'Ampersand', role: 'Orchestrator', model: 'ampersand-v0.1', color: c.magenta },
   beam: { name: 'Beam', role: 'Heavy Coder', model: 'beam-free', color: c.orange },
   flint: { name: 'Flint', role: 'Fast Coder', model: 'flint-v1.0', color: c.teal },
-  deepseek: { name: 'DeepSeek', role: 'Paid Heavy Coder', model: 'deepseek-v4.1-flash', color: c.blue },
+  deepseek: { name: 'DeepSeek', role: 'Paid Heavy Coder', model: 'deepseek-v4.1-flash-1017', color: c.blue },
   haiku: { name: 'Haiku', role: 'Paid Fast Coder', model: 'claude-haiku-5.5', color: c.amber },
 };
 export const badge = (k: AgentKey) => `${AGENTS[k].name} · ${AGENTS[k].role}`;

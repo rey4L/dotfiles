@@ -22,7 +22,7 @@ export interface Task {
 export const MODELS: Record<Worker, string> = {
   beam: 'reflection/beam-free',  // 1,048,576 ctx, 131k out, free tier = rate-limited
   flint: 'recursive/flint-v1.0', // 262,144 ctx, p50 ~0.85s TTFT on the gateway
-  deepseek: 'deepseek/deepseek-v4.1-flash', // paid $0.30/$1.20 per M, 1M ctx: last resort for big/long-horizon tasks
+  deepseek: 'deepseek/deepseek-v4.1-flash-1017', // paid $0.02/$0.29 per M (51% off list, 2026-11-23), 1M ctx assumed same as v4.1-flash
   haiku: 'anthropic/claude-haiku-5.5',      // paid $0.10/$0.50 per M, 1M ctx: last resort for scoped tasks
 };
 
