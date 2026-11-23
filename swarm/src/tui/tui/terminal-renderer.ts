@@ -1117,7 +1117,7 @@ export class TerminalRenderer {
   #workerLines(width: number): string[] {
     const now = Date.now();
     const used = new Set([...this.#workers.values()].map((w) => w.worker));
-    return (['beam', 'flint', 'deepseek', 'haiku'] as const).filter((k) => k === 'beam' || k === 'flint' || used.has(k)).map((k) => {
+    return (['beam', 'flint', 'deepseek', 'qwen'] as const).filter((k) => k === 'beam' || k === 'flint' || used.has(k)).map((k) => {
       const a = AGENTS[k];
       const mine = [...this.#workers.values()].filter((w) => w.worker === k);
       const active = mine.filter((w) => w.endedAt == null);

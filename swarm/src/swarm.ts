@@ -13,7 +13,7 @@ import { createMailbox, envelope, type Address } from './mailbox.ts';
 
 export const ORCHESTRATOR_MODEL = 'humansand/ampersand-v0.1';
 export const ORCHESTRATOR_CONTEXT = 1_000_000;
-export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, flint: 262_144, deepseek: 1_048_576, haiku: 1_000_000 };
+export const CONTEXT: Record<'orch' | Worker, number> = { orch: ORCHESTRATOR_CONTEXT, beam: 1_048_576, flint: 262_144, deepseek: 1_048_576, qwen: 262_144 };
 const MAX_DISPATCHES = 12; // per batch (a run without a plan is one batch)
 const MAX_BATCHES = 8;
 const ORCH_STEPS_PER_BATCH = 25; // orchestrator turns are slow (p50 ~8s); keep each batch's loop short
@@ -24,7 +24,7 @@ const WORKER_INSTRUCTIONS: Record<Worker, string> = {
   beam: 'You are the long-horizon engineer. Explore broadly, reason about architecture, then make coherent multi-file changes.',
   flint: 'You are the fast, scoped engineer. Make the smallest correct change to the leased files. Do not explore beyond what the task needs.',
   deepseek: 'You are the long-horizon engineer with vision. Explore broadly, reason about architecture, then make coherent multi-file changes.',
-  haiku: 'You are the scoped engineer with vision. Make the smallest correct change to the leased files.',
+  qwen: 'You are the scoped engineer with vision. Make the smallest correct change to the leased files.',
 };
 const VISION_HOWTO =
   'You can see images: view_image shows you a PNG/JPEG/WebP/GIF from the workspace. To look at a page, screenshot it with run_command, e.g. ' +
@@ -37,7 +37,7 @@ const finalStep = (messages: ModelMessage[], what: string) => ({
   toolChoice: 'none' as const,
   messages: [...messages, { role: 'user' as const, content: `Step budget used up: no more tool calls. Write your final report now: ${what}` }],
 });
-const STEP_CAP: Record<Worker, number> = { beam: 40, flint: 25, deepseek: 40, haiku: 25 }; // loop guard; Flint was 15 and ran out on most feature tasks (2026-11-22)
+const STEP_CAP: Record<Worker, number> = { beam: 40, flint: 25, deepseek: 40, qwen: 25 }; // loop guard; Flint was 15 and ran out on most feature tasks (2026-11-22)
 
 type Progress = { worker?: Worker; reason?: string; attempt?: number; log: string[]; done: boolean; summary?: string };
 type DispatchInput = Omit<Task, 'attempt' | 'force'> & { context?: string[] };
@@ -377,7 +377,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
 
   const dispatch = tool({
     description:
-      'Delegate one coding task. The router picks Beam (long-horizon/large context) or Flint (fast, scoped); a third attempt goes to a paid model. Set visual=true for web/UI work the worker must look at (vision models: Haiku scoped, DeepSeek large). ' +
+      'Delegate one coding task. The router picks Beam (long-horizon/large context) or Flint (fast, scoped); a third attempt goes to a paid model. Set visual=true for web/UI work the worker must look at (vision models: Qwen scoped, DeepSeek large). ' +
       'Declare every file the worker must write; tasks with overlapping files are rejected until the other finishes.',
     inputSchema: z.object({
       id: z.string(),

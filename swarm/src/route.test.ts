@@ -20,17 +20,17 @@ test('big context goes to beam even if flint preferred', () =>
 test('long-horizon kinds go to beam', () => assert.equal(route({ ...base, kind: 'terminal' }).worker, 'beam'));
 test('wide change goes to beam', () => assert.equal(route({ ...base, files: ['1', '2', '3', '4', '5', '6'] }).worker, 'beam'));
 test('second attempt escalates', () => assert.equal(route({ ...base, attempt: 2 }).worker, 'beam'));
-test('final attempt on a scoped task goes to haiku', () => assert.equal(route({ ...base, attempt: 3 }).worker, 'haiku'));
+test('final attempt on a scoped task goes to qwen', () => assert.equal(route({ ...base, attempt: 3 }).worker, 'qwen'));
 test('final attempt on a big task goes to deepseek', () => {
   assert.equal(route({ ...base, attempt: 3, estTokens: 400_000 }).worker, 'deepseek');
   assert.equal(route({ ...base, attempt: 3, kind: 'refactor' }).worker, 'deepseek');
 });
 test('visual tasks go to vision models by size, swapping on the final attempt', () => {
-  assert.equal(route({ ...base, visual: true }).worker, 'haiku');
-  assert.equal(route({ ...base, visual: true, attempt: 2 }).worker, 'haiku');
+  assert.equal(route({ ...base, visual: true }).worker, 'qwen');
+  assert.equal(route({ ...base, visual: true, attempt: 2 }).worker, 'qwen');
   assert.equal(route({ ...base, visual: true, attempt: 3 }).worker, 'deepseek');
   assert.equal(route({ ...base, visual: true, kind: 'refactor' }).worker, 'deepseek');
-  assert.equal(route({ ...base, visual: true, kind: 'refactor', attempt: 3 }).worker, 'haiku');
+  assert.equal(route({ ...base, visual: true, kind: 'refactor', attempt: 3 }).worker, 'qwen');
 });
 test('paid models only via the final attempt or force', () => {
   for (const a of [1, 2]) assert.ok(['beam', 'flint'].includes(route({ ...base, attempt: a, kind: 'explore' }).worker));

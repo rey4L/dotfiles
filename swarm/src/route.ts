@@ -1,7 +1,7 @@
 // Deterministic routing + file leases. Pure logic, no model calls — this is the part you test.
 
-export type Worker = 'beam' | 'flint' | 'deepseek' | 'haiku';
-export const VISION_WORKERS: Worker[] = ['deepseek', 'haiku'];
+export type Worker = 'beam' | 'flint' | 'deepseek' | 'qwen';
+export const VISION_WORKERS: Worker[] = ['deepseek', 'qwen'];
 export const FREE_WORKERS = ['beam', 'flint'] as const; // the orchestrator may only `prefer` these; paid ones are escalation/override only
 export type TaskKind =
   | 'explore' | 'architecture' | 'refactor' | 'terminal' // long-horizon
@@ -23,7 +23,7 @@ export const MODELS: Record<Worker, string> = {
   beam: 'reflection/beam-free',  // 1,048,576 ctx, 131k out, free tier = rate-limited
   flint: 'recursive/flint-v1.0', // 262,144 ctx, p50 ~0.85s TTFT on the gateway
   deepseek: 'deepseek/deepseek-v4.1-flash-1017', // paid $0.02/$0.29 per M (51% off list, 2026-11-23), 1M ctx assumed same as v4.1-flash
-  haiku: 'anthropic/claude-haiku-5.5',      // paid $0.10/$0.50 per M, 1M ctx: last resort for scoped tasks
+  qwen: 'alibaba/qwen3.8-27b',             // paid $0.06/$1.96 per M, 262k ctx, vision: scoped tasks
 };
 
 const FLINT_CTX_BUDGET = 180_000; // 262k minus room for reasoning + output
@@ -36,14 +36,14 @@ export function route(t: Task): { worker: Worker; reason: string } {
   const big = t.estTokens > FLINT_CTX_BUDGET || LONG_HORIZON.includes(t.kind) || t.files.length > 5;
   // Beam/Flint are text-only, so visual tasks start on a paid vision model and swap to the other one on the final attempt.
   if (t.visual) {
-    const first: Worker = big ? 'deepseek' : 'haiku';
-    const w: Worker = t.attempt >= MAX_ATTEMPTS ? (first === 'haiku' ? 'deepseek' : 'haiku') : first;
+    const first: Worker = big ? 'deepseek' : 'qwen';
+    const w: Worker = t.attempt >= MAX_ATTEMPTS ? (first === 'qwen' ? 'deepseek' : 'qwen') : first;
     return { worker: w, reason: `visual ${big ? 'large/long-horizon' : 'scoped'} task${w === first ? '' : ', final attempt on the other vision model'}` };
   }
   // Free models get two tries; only the final attempt spends money, on a different model family than the one that failed.
   if (t.attempt >= MAX_ATTEMPTS) return big
     ? { worker: 'deepseek', reason: 'final attempt after free models failed: large/long-horizon task' }
-    : { worker: 'haiku', reason: 'final attempt after free models failed: scoped task' };
+    : { worker: 'qwen', reason: 'final attempt after free models failed: scoped task' };
   if (t.estTokens > FLINT_CTX_BUDGET) return { worker: 'beam', reason: 'context exceeds Flint budget' };
   if (LONG_HORIZON.includes(t.kind)) return { worker: 'beam', reason: `${t.kind} is long-horizon` };
   if (t.files.length > 5) return { worker: 'beam', reason: 'touches >5 files' };
