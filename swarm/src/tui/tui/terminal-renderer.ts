@@ -771,7 +771,10 @@ export class TerminalRenderer {
         break;
       }
       case 'ratelimit':
-        this.#flash = { text: `rate limited on ${e.model}; retrying`, until: now + 8000 };
+        this.#flash = { text: e.message.startsWith('transient') ? `${e.model}: provider hiccup; retrying once` : `rate limited on ${e.model}; retrying`, until: now + 8000 };
+        break;
+      case 'message': // mailbox traffic (full text is in `swarm tail`); system nudges are noise here
+        if (e.from !== 'system') this.#flash = { text: `✉ ${e.from} → ${e.to}: ${e.text.replace(/\s+/g, ' ').slice(0, 160)}`, until: now + 12000 };
         break;
       case 'error':
         if (e.agent === 'orch' || !e.agent) this.#lastError = e.message;

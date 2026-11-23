@@ -7,8 +7,9 @@ import { resolve, relative, dirname, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { route, Leases, MODELS, FREE_WORKERS, VISION_WORKERS, type Task, type Worker } from './route.ts';
 import { runSandboxed } from './sandbox.ts';
-import type { Journal } from './journal.ts';
-import type { AgentId, Emit, Gate } from './events.ts';
+import type { Journal, ResumeState } from './journal.ts';
+import type { AgentId, Emit, Gate, Mode } from './events.ts';
+import { createMailbox, envelope, type Address } from './mailbox.ts';
 
 export const ORCHESTRATOR_MODEL = 'humansand/ampersand-v0.1';
 export const ORCHESTRATOR_CONTEXT = 1_000_000;
@@ -39,7 +40,7 @@ const finalStep = (messages: ModelMessage[], what: string) => ({
 const STEP_CAP: Record<Worker, number> = { beam: 40, flint: 25, deepseek: 40, haiku: 25 }; // loop guard; Flint was 15 and ran out on most feature tasks (2026-11-22)
 
 type Progress = { worker?: Worker; reason?: string; attempt?: number; log: string[]; done: boolean; summary?: string };
-type DispatchInput = Omit<Task, 'attempt' | 'force'>;
+type DispatchInput = Omit<Task, 'attempt' | 'force'> & { context?: string[] };
 
 export interface SwarmOptions {
   journal?: Journal;
@@ -48,7 +49,20 @@ export interface SwarmOptions {
   gate?: Gate; // approvals + pause
   askUser?: (question: string, signal?: AbortSignal) => Promise<string>; // enables the ask_user tool
   models?: Partial<Record<'orch' | Worker, LanguageModel>>; // test/mock injection
+  resume?: ResumeState; // engine state of the run being resumed (plan position, attempts, ledger)
+  inbox?: string; // path of <runId>.inbox for `swarm send`
+  mode?: Mode;
+  retryDelayMs?: number; // backoff before retrying a worker after a transient provider error (tests: 0)
 }
+const CONTEXT_FILE_MAX = 60_000; // per reference file inlined into a worker prompt
+const CONTEXT_TOTAL_MAX = 160_000;
+// Provider hiccups ("inference service temporarily unavailable", 5xx, deadlines) are not the worker's fault: retry once, same worker,
+// without counting an attempt (runs 2026-11-22T18-03 and 19-17: two Beam runs died this way and went straight to paid Haiku).
+const TRANSIENT = /unavailable|overloaded|temporar|deadline|timed? ?out|ECONNRESET|socket hang up|fetch failed|\b5\d\d\b/i;
+const isTransient = (e: unknown) => {
+  const err = e as { statusCode?: number; message?: string };
+  return (err?.statusCode ?? 0) >= 500 || TRANSIENT.test(err?.message ?? '');
+};
 
 export const hash = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 16);
 const tail = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v) ?? '').slice(-400);
@@ -56,25 +70,39 @@ const tail = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v) ?? '
 export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
   const log: Journal = opts.journal ?? (() => {});
   const emit: Emit = opts.emit ?? (() => {});
-  const gate = opts.gate;
   const ROOT = resolve(rootDir);
   const leases = new Leases();
-  const ledger = new Map<string, { worker: Worker; status: 'ok' | 'failed'; summary: string }>();
+  const ledger = new Map<string, { worker: string; status: string; summary: string }>(opts.resume?.ledger);
   const seen = new Map<string, number>(); // task id / lease set -> attempts (loop guard); cleared when the task succeeds
   const prevFiles = new Map<string, string[]>(); // task id -> files of the last attempt
+  for (const [id, n] of opts.resume?.attempts ?? []) seen.set(`id:${id}`, n);
+  for (const [id, f] of opts.resume?.files ?? []) if (seen.has(`id:${id}`)) prevFiles.set(`id:${id}`, f);
   const tasks = new Map<string, DispatchInput>(); // for manual re-dispatch
   const running = new Map<string, AbortController>(); // taskId -> per-worker cancel
   let dispatches = 0;
+  let mode: Mode = opts.mode ?? 'auto';
+  const mailbox = createMailbox(log, emit, opts.inbox, (to) => running.has(to.slice(5)));
+  // Journal approvals so a background run's "needs you" count survives (pendingCount in journal.ts).
+  const gate: Gate | undefined = opts.gate && {
+    checkpoint: opts.gate.checkpoint.bind(opts.gate),
+    async beforeTool(agent, tool, input, why, signal) {
+      const id = randomUUID().slice(0, 8);
+      log({ type: 'approval', id, agent, tool, why, state: 'request' });
+      const d = await opts.gate!.beforeTool(agent, tool, input, why, signal).catch((e) => { log({ type: 'approval', id, agent, tool, why, state: 'denied' }); throw e; });
+      log({ type: 'approval', id, agent, tool, why, state: d.approve ? 'approved' : 'denied' });
+      return d;
+    },
+  };
+  const contextCache = new Map<string, { mtime: number; text: string }>(); // reference files shared by every task in this run
   // Batch plan: a big request is split into batches; each gets a fresh dispatch budget and a compacted orchestrator context.
   type Batch = { id: string; goal: string; tasks: string[] };
-  let plan: { batches: Batch[]; verify?: string } | undefined;
-  let batchIdx = 0;
+  let plan: { batches: Batch[]; verify?: string } | undefined = opts.resume?.plan;
+  let batchIdx = opts.resume?.batchIdx ?? 0;
   let verifyFails = 0;
-  let halted = false; // verify failed twice: no more dispatches until the human steps in
+  let halted = opts.resume?.halted ?? false; // verify failed twice: no more dispatches until the human steps in
   let compactPending = false;
-  let compactFrom = -1; // index into this turn's messages; earlier ones are replaced by a handoff
   let turnBatchBase = 0;
-  const batchLog: string[] = [];
+  const batchLog: string[] = [...(opts.resume?.batchLog ?? [])];
   const batchEvent = (status: 'start' | 'done' | 'failed', summary?: string) => {
     const b = plan!.batches[batchIdx];
     const e = { type: 'batch' as const, id: b.id, index: batchIdx, total: plan!.batches.length, goal: b.goal, status, summary };
@@ -113,7 +141,51 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
   };
 
   const safe = makeSafe(ROOT);
-  const fsTools = (taskId: string, agent: AgentId) => instrument(makeFsTools(ROOT, leases, taskId, { emit, gate, agent }), agent, emit);
+  const fsTools = (taskId: string, agent: AgentId, preRead?: Map<string, number>) =>
+    instrument(makeFsTools(ROOT, leases, taskId, { emit, gate, agent, mode: () => mode, preRead }), agent, emit);
+
+  // Spec/reference files the orchestrator names in `context`: read once per run (cache keyed by mtime), inlined in the prompt.
+  // Workers used to re-read the same spec 8-11x across tasks and hit their step cap before writing (run 2026-11-22T18-03).
+  async function contextBlock(paths: string[]): Promise<{ text: string; preRead: Map<string, number> }> {
+    const preRead = new Map<string, number>();
+    const parts: string[] = [];
+    let total = 0;
+    for (const p of paths) {
+      try {
+        const abs = safe(p);
+        const mtime = (await stat(abs)).mtimeMs;
+        let c = contextCache.get(abs);
+        if (c?.mtime !== mtime) contextCache.set(abs, (c = { mtime, text: await readFile(abs, 'utf8') }));
+        const room = Math.min(CONTEXT_FILE_MAX, CONTEXT_TOTAL_MAX - total);
+        if (room <= 0) { parts.push(`=== ${p} === (omitted: context budget used; read it yourself if needed)`); continue; }
+        const body = c.text.length <= room ? c.text : `${c.text.slice(0, room)}\n… [truncated at ${room} of ${c.text.length} chars; read_file for the rest]`;
+        total += body.length;
+        parts.push(`=== ${p} ===\n${body}`);
+        if (c.text.length <= room) preRead.set(abs, mtime); // fully shown: a read_file of it is elided
+      } catch (e) {
+        parts.push(`=== ${p} === (unreadable: ${(e as Error).message})`);
+      }
+    }
+    return { text: parts.length ? `\n\nReference files, already read for you (do not read them again):\n${parts.join('\n\n')}` : '', preRead };
+  }
+
+  const sendTool = (from: AgentId) => tool({
+    description: from === 'orch'
+      ? 'Send a message to a RUNNING worker (to: "task:<id>") to steer it mid-task, or to the human (to: "human") as a non-blocking note. Delivered at the worker\'s next step.'
+      : 'Send a short message to the orchestrator (to: "orch") or the human (to: "human") without ending your task, e.g. the spec is wrong or another file must change. Replies arrive as a new message at a later step.',
+    inputSchema: z.object({ to: z.string(), text: z.string().min(1), inReplyTo: z.string().optional() }),
+    execute: async ({ to, text, inReplyTo }) => {
+      const dest = (to === 'orch' || to === 'human' || to.startsWith('task:') ? to : `task:${to}`) as Address;
+      if (from !== 'orch' && dest.startsWith('task:')) return 'DENIED: workers message "orch" or "human" only.';
+      const m = mailbox.send({ from, to: dest, text, inReplyTo });
+      return `sent ${m.id} to ${m.to}`;
+    },
+  });
+  // Drain this agent's mailbox into the step's messages (overrides persist into later steps in ai 7).
+  const deliver = (to: Address, messages: ModelMessage[]) => {
+    const got = mailbox.take(to);
+    return got.length ? [...messages, { role: 'user' as const, content: `[MESSAGES]\n${envelope(got)}` }] : messages;
+  };
 
   const runCommandTool = (agent: AgentId) => tool({
     description:
@@ -188,57 +260,91 @@ export function createSwarm(rootDir: string, opts: SwarmOptions = {}) {
       kick();
       const sig = AbortSignal.any([mine.signal, dog.signal, ...(signal ? [signal] : [])]);
 
-      let wake = () => {};
-      const agentLoop = new ToolLoopAgent({
-        model: model(worker),
-        instructions: `${WORKER_INSTRUCTIONS[worker]}
-${attempt > 1 ? 'Earlier attempts at this task failed: inspect the current workspace state before changing anything.\n' : ''}${VISION_WORKERS.includes(worker) ? VISION_HOWTO + '\n' : ''}You may only write: ${files.join(', ') || '(nothing — read-only task)'}.
-Use web_search/web_fetch only for docs or facts the workspace cannot answer.
+      const ctx = await contextBlock(input.context ?? []);
+      const tokens = { in: 0, out: 0 };
+      let wrote = false;
+      const cap = STEP_CAP[worker];
+      const runOnce = async (retry: boolean): Promise<string> => {
+        let wake = () => {};
+        const agentLoop = new ToolLoopAgent({
+          model: model(worker),
+          instructions: `${WORKER_INSTRUCTIONS[worker]}
+${attempt > 1 || retry ? 'Earlier attempts at this task failed or were interrupted: inspect the current workspace state before changing anything.\n' : ''}${VISION_WORKERS.includes(worker) ? VISION_HOWTO + '\n' : ''}You may only write: ${files.join(', ') || '(nothing — read-only task)'}.
+Write early: read only what the change needs, then edit. Use web_search/web_fetch only for docs or facts the workspace cannot answer. If you are blocked (wrong spec, another file must change), tell the orchestrator with send_message or report STATUS: failed — do not keep exploring.
 If you changed code and tests exist or you wrote them, run them with run_command and report the result; never claim tests pass without running them.
 End with: STATUS: ok|failed, then a summary under 200 words (files changed, tests run + result, open risks).`,
-        tools: { ...fsTools(input.id, agent), ...(VISION_WORKERS.includes(worker) ? instrument({ view_image: viewImageTool(ROOT) }, agent, emit) : {}), run_command: instrument({ run_command: runCommandTool(agent) }, agent, emit).run_command,
-          // Run at the gateway ($0.75 per 1K calls each), not in the sandbox, which stays offline.
-          web_search: gateway.tools.deepseekSearch(), web_fetch: gateway.tools.deepseekFetch() },
-        stopWhen: isStepCount(STEP_CAP[worker]),
-        maxRetries: 3, // beam-free is per-model rate-limited on the free tier
-        // no stripReasoning here: Beam rejects requests without its earlier reasoning_content (run 2, 2026-11-21)
-        prepareStep: async ({ stepNumber, messages }) => {
-          if (gate) await gate.checkpoint(agent, sig);
-          emit({ type: 'agent.status', agent, status: 'thinking' });
-          return stepNumber >= STEP_CAP[worker] - 1 ? finalStep(messages, 'STATUS: ok|failed (failed if the task is not finished), what you changed, what is left, tests run + result.') : {};
-        },
-        onStepEnd: (step) => {
-          kick();
-          for (const c of step.toolCalls) {
-            const line = `${c.toolName} ${JSON.stringify(c.input).slice(0, 100)}`;
-            p.log.push(line);
-            log({ type: 'worker', id: input.id, line });
+          tools: {
+            ...fsTools(input.id, agent, ctx.preRead),
+            ...(VISION_WORKERS.includes(worker) ? instrument({ view_image: viewImageTool(ROOT) }, agent, emit) : {}),
+            run_command: instrument({ run_command: runCommandTool(agent) }, agent, emit).run_command,
+            send_message: sendTool(agent),
+            // Run at the gateway ($0.75 per 1K calls each), not in the sandbox, which stays offline.
+            web_search: gateway.tools.deepseekSearch(),
+            web_fetch: gateway.tools.deepseekFetch(),
+          },
+          stopWhen: isStepCount(cap),
+          maxRetries: 3, // beam-free is per-model rate-limited on the free tier
+          // no stripReasoning here: Beam rejects requests without its earlier reasoning_content (run 2, 2026-11-21)
+          prepareStep: async ({ stepNumber, messages }) => {
+            if (gate) await gate.checkpoint(agent, sig);
+            emit({ type: 'agent.status', agent, status: 'thinking' });
+            if (stepNumber === Math.floor(cap / 2) && !wrote && files.length)
+              mailbox.send({ from: 'system', to: agent, text: `You have used ${stepNumber} of ${cap} steps without changing any file. Stop exploring: make the change now, or report STATUS: failed with what blocks you.` });
+            const msgs = deliver(agent, messages);
+            if (stepNumber >= cap - 1) return finalStep(msgs, 'STATUS: ok|failed (failed if the task is not finished), what you changed, what is left, tests run + result.');
+            return msgs === messages ? {} : { messages: msgs };
+          },
+          onStepEnd: (step) => {
+            kick();
+            tokens.in += step.usage.inputTokens ?? 0;
+            tokens.out += step.usage.outputTokens ?? 0;
+            for (const c of step.toolCalls) {
+              const line = `${c.toolName} ${JSON.stringify(c.input).slice(0, 100)}`;
+              p.log.push(line);
+              log({ type: 'worker', id: input.id, line });
+            }
+            // Journal a short output tail per tool so `swarm tail` can explain odd behaviour (run 3: Beam looping on `echo hello`).
+            for (const r of step.toolResults) {
+              if ((r.toolName === 'write_file' || r.toolName === 'edit_file') && /^(created|edited) /.test(String(r.output))) wrote = true;
+              log({ type: 'worker', id: input.id, line: `  → ${r.toolName}: ${tail(r.output).replace(/\s+/g, ' ').slice(0, 160)}` });
+            }
+            for (const e of toolErrors(step)) log({ type: 'worker', id: input.id, line: `  ✗ ${e}` });
+            stepEvent(agent, worker, step as StepResult<ToolSet>);
+            wake();
+          },
+        });
+        let settled = false;
+        const run = (async () => {
+          const s = await agentLoop.stream({ prompt: input.goal + ctx.text, abortSignal: sig });
+          let streamErr: unknown;
+          for await (const part of s.fullStream) {
+            if (part.type === 'text-delta') emit({ type: 'text.delta', agent, delta: part.text });
+            else if (part.type === 'error') streamErr = part.error;
           }
-          // Journal a short output tail per tool so `swarm tail` can explain odd behaviour (run 3: Beam looping on `echo hello`).
-          for (const r of step.toolResults) {
-            log({ type: 'worker', id: input.id, line: `  → ${r.toolName}: ${tail(r.output).replace(/\s+/g, ' ').slice(0, 160)}` });
-          }
-          stepEvent(agent, worker, step as StepResult<ToolSet>);
-          wake();
-        },
-      });
-      let settled = false;
-      const run = (async () => {
-        const s = await agentLoop.stream({ prompt: input.goal, abortSignal: sig });
-        let streamErr: unknown;
-        for await (const part of s.fullStream) {
-          if (part.type === 'text-delta') emit({ type: 'text.delta', agent, delta: part.text });
-          else if (part.type === 'error') streamErr = part.error;
+          if (sig.aborted) throw sig.reason instanceof Error ? sig.reason : new Error('cancelled');
+          if (streamErr) throw streamErr instanceof Error ? streamErr : new Error(String(streamErr));
+          return await s.text;
+        })().finally(() => { settled = true; wake(); });
+        while (!settled) {
+          await new Promise<void>((r) => (wake = r));
+          onProgress({ ...p, log: [...p.log] });
         }
-        if (sig.aborted) throw sig.reason instanceof Error ? sig.reason : new Error('cancelled');
-        if (streamErr) throw streamErr instanceof Error ? streamErr : new Error(String(streamErr));
-        return await s.text;
-      })().finally(() => { settled = true; clearTimeout(timer); wake(); });
-      while (!settled) {
-        await new Promise<void>((r) => (wake = r));
-        onProgress({ ...p, log: [...p.log] });
+        return run;
+      };
+      let text: string;
+      try {
+        text = await runOnce(false);
+      } catch (e) {
+        if (sig.aborted || !isTransient(e)) throw e;
+        const msg = (e as Error).message;
+        log({ type: 'worker', id: input.id, line: `  ↻ transient provider error, retrying once on ${worker}: ${msg.slice(0, 200)}` });
+        emit({ type: 'ratelimit', model: MODELS[worker], message: `transient, retrying: ${msg.slice(0, 200)}` });
+        await new Promise((r) => setTimeout(r, opts.retryDelayMs ?? 20_000));
+        kick();
+        text = await runOnce(true);
+      } finally {
+        clearTimeout(timer);
       }
-      const text = await run;
       const status: 'ok' | 'failed' = /STATUS:\s*ok/i.test(text) ? 'ok' : 'failed';
       // An empty final text (usually the step limit) used to surface as a blank `failed` and trigger a blind escalation.
       // Long reports are cut to their tail, which dropped the STATUS line: the TUI then showed ok tasks as "failed" and the
@@ -249,7 +355,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
           `Inspect the workspace before retrying. Last actions:\n${p.log.slice(-6).join('\n')}`;
       ledger.set(input.id, { worker, status, summary });
       if (status === 'ok') keys.forEach((k) => seen.delete(k)); // later, different work on the same files starts fresh
-      log({ type: 'result', id: input.id, status, summary });
+      log({ type: 'result', id: input.id, status, summary, tokens });
       emit({ type: 'task.result', taskId: input.id, worker, status, summary });
       emit({ type: 'agent.status', agent, status: status === 'ok' ? 'done' : 'error' });
       return `[${worker}: ${r.reason}] attempt ${attempt}\n${summary}`;
@@ -258,7 +364,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       const stuck = msg.startsWith('watchdog:');
       const cancelled = !stuck && (mine.signal.aborted || signal?.aborted);
       const status = stuck ? 'stuck' : cancelled ? 'cancelled' : 'failed';
-      log({ type: 'result', id: input.id, status: status === 'cancelled' ? 'failed' : status, summary: msg });
+      log({ type: 'result', id: input.id, status, summary: msg });
       emit({ type: 'task.result', taskId: input.id, worker, status, summary: msg });
       emit({ type: 'agent.status', agent, status: cancelled ? 'cancelled' : 'error', detail: msg.slice(0, 200) });
       return `${stuck ? 'STUCK' : cancelled ? 'CANCELLED by the human' : 'ERROR'}: ${msg}`;
@@ -280,11 +386,13 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       files: z.array(z.string()).default([]),
       estTokens: z.number().int().nonnegative(),
       prefer: z.enum(FREE_WORKERS).optional(),
+      context: z.array(z.string()).default([]).describe('Spec/reference files the worker needs (e.g. the task brief, shared types). They are read once and put in the worker prompt, so workers do not spend steps re-reading them.'),
       visual: z.boolean().optional().describe('true when the worker must LOOK at something: web/UI work, screenshots, design mockups, images, diagrams (architecture/flow/sequence). Routes to a vision model that can screenshot pages and view images.'),
     }),
     // Generator: each yield updates the TUI tool card; toModelOutput sends only the summary to the orchestrator.
     execute: async function* (input, { abortSignal }): AsyncGenerator<Progress> {
       const finish = (p: Progress, summary: string) => ({ ...p, done: true, summary });
+      if (mode === 'plan') return yield finish({ log: [], done: false }, 'REFUSED: plan mode. Do not dispatch; present your plan (tasks, files, order, risks) and stop.');
       if (halted) return yield finish({ log: [], done: false }, 'REFUSED: the batch plan is halted (verify failed twice). Report to the user.');
       if (++dispatches > MAX_DISPATCHES) {
         return yield finish({ log: [], done: false }, plan
@@ -317,8 +425,10 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
     description: 'Ask the human a question and wait for the answer. Use it for real ambiguity or when workers conflict; not for routine progress.',
     inputSchema: z.object({ question: z.string() }),
     execute: async ({ question }, { abortSignal }) => {
+      const id = randomUUID().slice(0, 8);
+      log({ type: 'ask', id, question, state: 'request' });
       emit({ type: 'human.input', question });
-      return opts.askUser!(question, abortSignal);
+      try { return await opts.askUser!(question, abortSignal); } finally { log({ type: 'ask', id, question, state: 'answered' }); }
     },
   });
 
@@ -338,6 +448,7 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       batchIdx = verifyFails = dispatches = 0;
       halted = false;
       batchLog.length = 0;
+      log({ type: 'plan', batches: plan.batches, verify: plan.verify });
       batchEvent('start');
       return `Plan saved. Batch 1/${plan.batches.length} (${plan.batches[0].id}): ${plan.batches[0].goal}\nTasks: ${plan.batches[0].tasks.join('; ')}\nCall batch_done when its tasks are done.`;
     },
@@ -392,24 +503,30 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
 - A failed task may be retried once with the SAME goal text (the router escalates it). Never retry more than that.
 - Workers can run tests in a sandbox; ask for that in goals that change code.
 - If the request needs more than ~10 dispatches, call plan FIRST to split it into batches; work one batch at a time and call batch_done after each. Never try to fit a big request into one batch.
+- Put the spec/brief and shared type files each task needs in dispatch \`context\`; workers then start writing instead of re-reading.
+- Dispatch all independent tasks of a batch in the SAME step (parallel tool calls); one dispatch per step wastes minutes.
+- Messages from workers, the human or the system arrive as [MESSAGES]; answer a running worker with send_message (to: "task:<id>").
 - Pass when there is nothing useful to add. Finish with a short report: done, not done, risks.${
       opts.resumeContext ? `\n\nYou are RESUMING an earlier run. Restored state from its journal:\n${opts.resumeContext}` : ''}`,
-    tools: { dispatch, status, plan: plan_tool, batch_done, list_files, read_file, ...(opts.askUser ? { ask_user } : {}) },
+    tools: { dispatch, status, plan: plan_tool, batch_done, list_files, read_file, send_message: sendTool('orch'), ...(opts.askUser ? { ask_user } : {}) },
     stopWhen: ({ steps }) => steps.length >= ORCH_STEPS_PER_BATCH * (1 + batchIdx - turnBatchBase),
     // Ampersand returns encrypted reasoning; once the TUI rebuilds history from UI messages the gateway
     // rejects it ("Encrypted reasoning is invalid or incompatible", 400). Prior reasoning isn't needed, so drop it.
     prepareStep: async ({ messages, stepNumber }) => {
       const last = messages.at(-1);
       if (stepNumber === 0) {
-        compactFrom = -1;
         turnBatchBase = Math.min(batchIdx, plan?.batches.length ?? 0);
         if (last?.role === 'user') log({ type: 'user', text: msgText(last) });
       }
-      if (compactPending) { compactFrom = messages.length; compactPending = false; }
-      if (compactFrom >= 0 && plan) {
-        const request = [...messages.slice(0, compactFrom)].reverse().find((m) => m.role === 'user');
-        messages = [{ role: 'user', content: handoff(request ? msgText(request) : '') }, ...messages.slice(compactFrom)];
+      // Compact ONCE when a batch closes: prepareStep overrides persist into later steps (ai 7), so the old per-step re-slice at a
+      // fixed index dropped every new step and the orchestrator in batch 2+ saw only the handoff (it looped on status/read_file).
+      if (compactPending && plan) {
+        compactPending = false;
+        const request = [...messages].reverse().find((m) => m.role === 'user' && !/^(\[MESSAGES\]|Step budget used up)/.test(msgText(m)));
+        const orig = request ? msgText(request).split('\n\n[BATCH HANDOFF]')[0] : '';
+        messages = [{ role: 'user', content: handoff(orig) }];
       }
+      messages = deliver('orch', messages);
       if (gate) await gate.checkpoint('orch');
       emit({ type: 'agent.status', agent: 'orch', status: 'thinking' });
       if (stepNumber >= ORCH_STEPS_PER_BATCH * (1 + batchIdx - turnBatchBase) - 1)
@@ -417,7 +534,8 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
       return { messages: stripReasoning(messages) };
     },
     onStepEnd: (step) => {
-      log({ type: 'step', text: step.text, tools: step.toolCalls.map((c) => c.toolName) });
+      const errors = toolErrors(step);
+      log({ type: 'step', text: step.text, tools: step.toolCalls.map((c) => c.toolName), usage: { in: step.usage.inputTokens ?? 0, out: step.usage.outputTokens ?? 0 }, ...(errors.length ? { errors } : {}) });
       stepEvent('orch', 'orch', step as StepResult<ToolSet>);
     },
   });
@@ -427,6 +545,10 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
     cancel(taskId: string) { running.get(taskId)?.abort(new Error('cancelled by user')); return running.has(taskId); },
     cancelAll() { for (const c of running.values()) c.abort(new Error('cancelled by user')); },
     running: () => [...running.keys()],
+    // Message any agent ('orch', 'task:<id>'); delivered at its next step. A UI's "take over" note goes through here.
+    send(to: Address, text: string, inReplyTo?: string) { return mailbox.send({ from: 'human', to, text, inReplyTo }); },
+    setMode(m: Mode) { mode = m; log({ type: 'mode', mode: m }); emit({ type: 'mode', mode: m }); },
+    mode: () => mode,
     redispatch(taskId: string, worker: Worker, signal?: AbortSignal) {
       const t = tasks.get(taskId);
       if (!t) throw new Error(`unknown task ${taskId}`);
@@ -435,6 +557,13 @@ End with: STATUS: ok|failed, then a summary under 200 words (files changed, test
     },
   };
   return Object.assign(agent, { controls });
+}
+
+// Tool calls that failed (bad input, thrown errors): journaled so a rejected dispatch is visible (run 19-17: 6 of 14 rejected, unlogged).
+function toolErrors(step: { content: readonly unknown[] }): string[] {
+  return (step.content as { type: string; toolName?: string; error?: unknown }[])
+    .filter((c) => c.type === 'tool-error')
+    .map((c) => `${c.toolName}: ${(c.error instanceof Error ? c.error.message : String(c.error)).replace(/\s+/g, ' ').slice(0, 300)}`);
 }
 
 export function stripReasoning(messages: ModelMessage[]): ModelMessage[] {
@@ -500,13 +629,14 @@ export function viewImageTool(ROOT: string) {
   });
 }
 
-type FsHooks = { emit?: Emit; gate?: Gate; agent?: AgentId };
+type FsHooks = { emit?: Emit; gate?: Gate; agent?: AgentId; mode?: () => Mode; preRead?: Map<string, number> };
 
 export function makeFsTools(ROOT: string, leases: Leases, taskId: string, h: FsHooks = {}) {
   const safe = makeSafe(ROOT);
   const emit = h.emit ?? (() => {});
   const agent: AgentId = h.agent ?? `task:${taskId}`;
-  const lastRead = new Map<string, number>(); // path -> mtimeMs, per task: repeat reads of unchanged files are elided
+  const lastRead = new Map<string, number>(h.preRead); // path -> mtimeMs, per task: repeat reads of unchanged files are elided
+  const ask = () => !!h.gate && h.mode?.() === 'ask';
   const snap = (s: string) => (s.length <= SNAPSHOT_MAX ? s : undefined);
   return {
     list_files: tool({
@@ -536,9 +666,14 @@ export function makeFsTools(ROOT: string, leases: Leases, taskId: string, h: FsH
     write_file: tool({
       description: 'Create a NEW file in your lease. Fails if the file exists — use edit_file for existing files.',
       inputSchema: z.object({ path: z.string(), content: z.string() }),
-      execute: async ({ path, content }) => {
+      execute: async ({ path, content }, o) => {
         const rel = relative(ROOT, safe(path));
         if (!leases.holds(taskId, rel)) return `DENIED: ${rel} is not in your lease; report it instead.`;
+        if (ask()) {
+          const d = await h.gate!.beforeTool(agent, 'write_file', { path: rel, content }, 'ask mode: create file', o?.abortSignal);
+          if (!d.approve) return `DENIED by the human reviewer: do not create ${rel}; report it.`;
+          content = (d.input as { content?: string } | undefined)?.content ?? content;
+        }
         await mkdir(dirname(safe(path)), { recursive: true });
         try {
           await writeFile(safe(path), content, { flag: 'wx' });
@@ -564,11 +699,11 @@ export function makeFsTools(ROOT: string, leases: Leases, taskId: string, h: FsH
         if (n !== 1) return `FAILED: old_string matches ${n} times in ${rel}; it must match exactly once.`;
         let next = text.replace(old_string, () => new_string);
         // Destructive edit (drops more than half the file): ask the human first when a gate is present.
-        if (h.gate && next.length < text.length / 2) {
+        if (h.gate && (next.length < text.length / 2 || ask())) {
           emit({ type: 'agent.status', agent, status: 'awaiting_approval', detail: `edit ${rel} (-${text.length - next.length} chars)` });
-          const d = await h.gate.beforeTool(agent, 'edit_file', { path: rel, old_string, new_string }, `removes ${Math.round((1 - next.length / text.length) * 100)}% of ${rel}`, o?.abortSignal);
+          const d = await h.gate.beforeTool(agent, 'edit_file', { path: rel, old_string, new_string }, next.length < text.length / 2 ? `removes ${Math.round((1 - next.length / text.length) * 100)}% of ${rel}` : `ask mode: edit ${rel}`, o?.abortSignal);
           emit({ type: 'agent.status', agent, status: 'tool', detail: 'edit_file' });
-          if (!d.approve) return `DENIED by the human reviewer: this edit removes most of ${rel}. Make a smaller edit or report.`;
+          if (!d.approve) return `DENIED by the human reviewer: edit of ${rel} rejected. Make a smaller edit or report.`;
           const ns = (d.input as { new_string?: string } | undefined)?.new_string;
           if (ns !== undefined) next = text.replace(old_string, () => ns);
         }

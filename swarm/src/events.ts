@@ -3,6 +3,8 @@ import type { Worker } from './route.ts';
 export type AgentId = 'orch' | `task:${string}`;
 export type AgentStatus =
   | 'idle' | 'queued' | 'thinking' | 'tool' | 'awaiting_approval' | 'paused' | 'error' | 'done' | 'cancelled';
+// auto: today's behavior; ask: every file write also goes through the gate; plan: dispatch refused, orchestrator only plans.
+export type Mode = 'auto' | 'ask' | 'plan';
 export type Usage = { in: number; out: number; reasoning?: number; cacheRead?: number };
 
 export type SwarmEvent =
@@ -21,6 +23,8 @@ export type SwarmEvent =
   | { type: 'human.input'; question: string }
   | { type: 'batch'; id: string; index: number; total: number; goal: string; status: 'start' | 'done' | 'failed'; summary?: string }
   | { type: 'ratelimit'; model: string; message: string }
+  | { type: 'message'; id: string; from: string; to: string; text: string; inReplyTo?: string }
+  | { type: 'mode'; mode: Mode }
   | { type: 'error'; agent?: AgentId; message: string };
 
 export type Emit = (e: SwarmEvent) => void;

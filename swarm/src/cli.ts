@@ -6,7 +6,7 @@ import { runAgentTUI } from './tui/index.ts';
 import { basename, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { createSwarm, ORCHESTRATOR_CONTEXT } from './swarm.ts';
-import { openJournal, readJournal, summarize } from './journal.ts';
+import { openJournal, readJournal, summarize, resumeState, inboxPath } from './journal.ts';
 import { createHost } from './tui/host.ts';
 
 const argv = process.argv.slice(2);
@@ -33,20 +33,22 @@ while (true) {
   const journal = openJournal(runId);
   const prior = resumeFrom ? readJournal(resumeFrom) : undefined;
   const resumeContext = prior ? summarize(prior) : undefined;
+  const resume = prior ? resumeState(prior) : undefined;
+  const inbox = inboxPath(runId);
   journal({ type: 'start', dir, mode, pid: process.pid, resumeOf: resumeFrom });
   let next: string | undefined;
 
   try {
     if (mode === 'tui') {
       const { host, emit, gate, enforcePlanMode } = createHost({ runId, titleLabel: basename(dir), onResume: (id) => { next = id; } });
-      const swarm = createSwarm(dir, { journal, resumeContext, emit, gate });
+      const swarm = createSwarm(dir, { journal, resumeContext, resume, inbox, emit, gate });
       enforcePlanMode(swarm as unknown as { tools: Record<string, { execute?: unknown }> });
       await runAgentTUI({
         title: `${basename(dir)} · ${runId}${resumeFrom ? ` · resumed ${resumeFrom}` : ''}`,
         agent: swarm, tools: 'auto-collapsed', contextSize: ORCHESTRATOR_CONTEXT, swarm: host,
       });
     } else {
-      const swarm = createSwarm(dir, { journal, resumeContext });
+      const swarm = createSwarm(dir, { journal, resumeContext, resume, inbox });
       console.error(`swarm run ${runId}`);
       const result = await swarm.generate({ prompt: rest[0] });
       console.log(result.text);
