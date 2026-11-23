@@ -75,7 +75,11 @@
   hardware.graphics.enable = true;
 
   # Printing
-  services.printing.enable = true;
+  services.printing = {
+    enable = true;
+    drivers = [ pkgs.hplip ];
+  };
+  services.ipp-usb.enable = true;
   services.avahi = {
     enable = true;
     nssmdns4 = true;
